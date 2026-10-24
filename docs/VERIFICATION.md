@@ -93,11 +93,17 @@ sudo systemctl suspend    # resume, then:
 journalctl -u thermite -b --since "10 min ago"   # grace re-apply messages
 ```
 
-## 5. Findings so far (2026-10-24, before these runs)
+## 5. Findings (2026-10-24, after the first successful on-target run)
 
 | Assumption | Status | Source |
 |---|---|---|
-| EC writes useless for fan control on ANV15-51 | verified by community (nbfc #219); Thermite never writes EC | docs/INVESTIGATION.md |
-| `predator_v4=1` → hwmon + profiles, no pwm | verified in mainline source + community test | HARDWARE.md |
-| ANV15-51 quirk = full control incl. independent dual fans | patch author-tested on BIOS V1.60 (lore v4) | INVESTIGATION.md |
-| turbo profile EIO | patch author-tested | INVESTIGATION.md |
+| EC writes useless for fan control on ANV15-51 | community evidence; Thermite never writes EC | docs/INVESTIGATION.md |
+| `predator_v4=1` → hwmon + profiles, no pwm | **verified on this machine** (diagnose-driver.sh §3) | HARDWARE.md |
+| ANV15-51 quirk = full control incl. independent dual fans | **verified on this machine** (BIOS V1.60): fan1/fan2 RPM + pwm1/2 + temp1-3 + 5 profiles | INVESTIGATION.md |
+| turbo profile absent | **verified**: choices list has no turbo | this run |
+| hwmon registers as `acer`, not `acer_wmi` | **verified** (fixed in Thermite's probe) | this run |
+| first driver swap after dkms install can silently no-op | **observed once**; setup script now retries the swap | this run |
+
+Full green run: `thermite-setup.sh` completed with `thermite doctor` →
+"everything wired for full fan control", daemon live (capability Full),
+fans 2675/2461 RPM idle.
