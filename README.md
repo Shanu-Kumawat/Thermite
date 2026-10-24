@@ -36,30 +36,27 @@ The investigation that shaped this architecture is in
 
 ```sh
 # build
-cargo build --release
+cargo build --release -p thermite-daemon -p thermite-cli -p thermite-gui
 
 # diagnose what this machine can do right now (no root needed)
 thermite doctor
 
-# with root: enable the full control path (kernel 7.2)
-sudo modprobe -r acer_wmi && sudo modprobe acer_wmi predator_v4=1   # monitoring + profiles
-# or build+install the stopgap module for manual fan control (see driver/)
+# one-shot install: stopgap driver (DKMS) + binaries + systemd service
+# + thermite group + verification. Asks for sudo itself.
+sudo bash scripts/thermite-setup.sh
 
-# install + run the daemon
-sudo install -Dm755 target/release/thermite-daemon /usr/bin/thermite-daemon
-sudo install -Dm755 target/release/thermite /usr/bin/thermite
-sudo install -Dm644 packaging/thermite.service /usr/lib/systemd/system/thermite.service
-sudo install -Dm644 packaging/sysusers.conf /usr/lib/sysusers.d/thermite.conf
-sudo install -Dm644 packaging/tmpfiles.conf /usr/lib/tmpfiles.d/thermite.conf
-sudo systemd-sysusers /usr/lib/sysusers.d/thermite.conf
-sudo install -Dm600 examples/thermite.toml /etc/thermite/thermite.toml   # optional; defaults work
-sudo usermod -aG thermite $USER   # let your user talk to the daemon
-sudo systemctl enable --now thermite
+# undo everything (or --keep-app to remove just the driver at kernel 7.3+)
+sudo bash scripts/thermite-remove.sh
+```
 
+The manual equivalent of the setup script is in
+[`docs/VERIFICATION.md`](docs/VERIFICATION.md). After it completes:
+
+```sh
 thermite status
 thermite fan cpu curve balanced
-thermite profile set quiet
 thermite monitor
+thermite-gui   # after logging out and back in once (group membership)
 ```
 
 The GUI (`target/release/thermite-gui`) connects to the same daemon; add your
