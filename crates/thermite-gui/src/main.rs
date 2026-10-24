@@ -12,7 +12,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use gpui_kit::component::chart::AreaChart;
-use gpui_kit::component::{ActiveTheme, Theme, ThemeMode, TitleBar, h_flex, v_flex};
+use gpui_kit::component::{h_flex, v_flex, ActiveTheme, Icon, Theme, ThemeMode, TitleBar};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use thermite_core::config::{Config, FanConfig, FanModeKind};
@@ -22,14 +22,62 @@ use thermite_proto::{
     StatusSnapshot,
 };
 
+mod icons {
+    //! Lucide icons (ISC license, https://lucide.dev) bundled as raw SVG so
+    //! the UI can use glyphs outside the default asset bundle.
+    pub const HOUSE: &str = include_str!("../assets/icons/house.svg");
+    pub const FAN: &str = include_str!("../assets/icons/fan.svg");
+    pub const CHART_LINE: &str = include_str!("../assets/icons/chart-line.svg");
+    pub const LAYOUT_GRID: &str = include_str!("../assets/icons/layout-grid.svg");
+    pub const LAYERS: &str = include_str!("../assets/icons/layers.svg");
+    pub const ZAP: &str = include_str!("../assets/icons/zap.svg");
+    pub const SHIELD_CHECK: &str = include_str!("../assets/icons/shield-check.svg");
+    pub const THERMOMETER: &str = include_str!("../assets/icons/thermometer.svg");
+    pub const LIST_FILTER: &str = include_str!("../assets/icons/list-filter.svg");
+    pub const FLAME: &str = include_str!("../assets/icons/flame.svg");
+}
+
+/// Render a bundled Lucide SVG at a given size and color.
+fn svg_icon(bytes: &str, color: Hsla, size: f32) -> Icon {
+    Icon::default()
+        .data(bytes.as_bytes())
+        .text_color(color)
+        .size(px(size))
+}
+
+/// Static machine identity for the header subtitle (read once at startup).
+struct MachineInfo {
+    product: String,
+    os: String,
+}
+
+impl MachineInfo {
+    fn probe() -> Self {
+        let product = std::fs::read_to_string("/sys/class/dmi/id/product_name")
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|_| "unknown machine".into());
+        let os = std::fs::read_to_string("/etc/os-release")
+            .ok()
+            .and_then(|s| {
+                s.lines().find_map(|l| {
+                    l.strip_prefix("PRETTY_NAME=").map(|v| {
+                        v.trim_matches('"').trim().to_string()
+                    })
+                })
+            })
+            .unwrap_or_else(|| "Linux".into());
+        Self { product, os }
+    }
+}
+
 /// Samples kept for charts (at 1 Hz ≈ 4 minutes).
 const MAX_SAMPLES: usize = 240;
 
-/// CPU/GPU/RPM palette.
+/// Palette for the metric cards (mockup: orange CPU, violet GPU, cyan fans).
 const CPU_COLOR: Hsla = hsla(0.066, 0.9, 0.6, 1.0); // orange
 const GPU_COLOR: Hsla = hsla(0.75, 0.6, 0.68, 1.0); // violet
-const CPU_RPM_COLOR: Hsla = hsla(0.52, 0.85, 0.62, 1.0); // cyan
-const GPU_RPM_COLOR: Hsla = hsla(0.52, 0.7, 0.5, 1.0); // dimmer cyan
+const FAN_COLOR: Hsla = hsla(0.52, 0.85, 0.62, 1.0); // cyan
+const FAN_COLOR_DIM: Hsla = hsla(0.52, 0.7, 0.5, 1.0); // dimmer cyan
 
 /// One telemetry sample for the charts.
 #[derive(Clone)]
@@ -88,6 +136,14 @@ impl Nav {
             Nav::Profiles => "Profiles",
         }
     }
+    fn icon(self) -> &'static str {
+        match self {
+            Nav::Dashboard => icons::HOUSE,
+            Nav::Fans => icons::FAN,
+            Nav::Curves => icons::CHART_LINE,
+            Nav::Profiles => icons::LAYOUT_GRID,
+        }
+    }
     fn all() -> [Nav; 4] {
         [Nav::Dashboard, Nav::Fans, Nav::Curves, Nav::Profiles]
     }
@@ -97,6 +153,7 @@ impl Nav {
 /// and the command channel.
 pub struct ThermiteApp {
     socket: PathBuf,
+    machine: MachineInfo,
     nav: Nav,
     connected: bool,
     status: Option<StatusSnapshot>,
@@ -140,6 +197,7 @@ impl ThermiteApp {
 
         Self {
             socket,
+            machine: MachineInfo::probe(),
             nav: Nav::Dashboard,
             connected: false,
             status: None,
@@ -300,77 +358,158 @@ impl ThermiteApp {
 
     fn render_nav(&self, cx: &Context<Self>) -> impl IntoElement {
         v_flex()
-            .w(px(180.))
+            .w(px(210.))
             .h_full()
             .flex_none()
             .border_r_1()
-            .border_color(cx.theme().border)
+            .border_color(cx.theme().sidebar_border)
             .bg(cx.theme().sidebar)
-            .pt_4()
+            .child(
+                // Brand
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .px_5()
+                    .h(px(56.))
+                    .child(svg_icon(icons::FLAME, CPU_COLOR, 20.))
+                    .child(
+                        div()
+                            .text_base()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(cx.theme().sidebar_foreground)
+                            .child("Thermite"),
+                    ),
+            )
+            .px_2()
             .gap_1()
             .children(Nav::all().map(|nav| {
                 let active = self.nav == nav;
                 let label = nav.label();
-                div()
+                h_flex()
                     .id(SharedString::new(format!("nav-{label}")))
-                    .px_4()
+                    .gap_3()
+                    .items_center()
+                    .px_3()
                     .py_2()
-                    .mx_2()
+                    .rounded_md()
                     .text_sm()
-                    .rounded_sm()
                     .when(active, |this| {
-                        this.bg(cx.theme().accent)
-                            .text_color(cx.theme().accent_foreground)
+                        this.bg(cx.theme().sidebar_accent)
+                            .text_color(cx.theme().sidebar_accent_foreground)
                     })
                     .when(!active, |this| {
-                        this.text_color(cx.theme().foreground)
-                            .hover(|this| this.bg(cx.theme().accent.opacity(0.1)))
+                        this.text_color(cx.theme().sidebar_foreground.opacity(0.75))
+                            .hover(|this| {
+                                this.bg(cx.theme().sidebar_accent.opacity(0.5))
+                                    .text_color(cx.theme().sidebar_foreground)
+                            })
                     })
                     .on_click(cx.listener(move |this, _ev: &ClickEvent, _window, cx| {
                         this.nav = nav;
                         cx.notify();
                     }))
+                    .child(svg_icon(nav.icon(), if active {
+                        cx.theme().sidebar_accent_foreground
+                    } else {
+                        cx.theme().sidebar_foreground.opacity(0.6)
+                    }, 16.))
                     .child(label.to_string())
             }))
             .child(
-                div()
-                    .px_4()
-                    .py_2()
+                // Daemon status pinned to the bottom
+                h_flex()
+                    .mt_auto()
                     .mx_2()
-                    .mt_4()
-                    .text_xs()
-                    .text_color(if self.connected {
-                        cx.theme().green
-                    } else {
-                        cx.theme().red
+                    .mb_3()
+                    .gap_2()
+                    .items_center()
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .when(self.connected, |this| {
+                        this.bg(cx.theme().green.opacity(0.1))
+                            .text_color(cx.theme().green)
                     })
-                    .child(if self.connected {
-                        "● daemon online"
-                    } else {
-                        "○ daemon offline"
-                    }),
+                    .when(!self.connected, |this| {
+                        this.bg(cx.theme().red.opacity(0.1))
+                            .text_color(cx.theme().red)
+                    })
+                    .child(
+                        div()
+                            .size(px(8.))
+                            .rounded_full()
+                            .bg(if self.connected {
+                                cx.theme().green
+                            } else {
+                                cx.theme().red
+                            }),
+                    )
+                    .child(
+                        div().text_sm().child(if self.connected {
+                            "daemon online".to_string()
+                        } else {
+                            "daemon offline".to_string()
+                        }),
+                    ),
             )
     }
 }
 
-/// Small label+value chip; needs the render context, hence a macro.
-macro_rules! chip {
-    ($cx:expr, $label:expr, $value:expr, $color:expr) => {{
+/// A header status chip: colored icon tile + label + value. `clickable`
+/// adds a hover state (the Profile chip navigates to the Profiles page).
+macro_rules! status_chip {
+    ($cx:expr, $id:expr, $icon:expr, $icon_color:expr, $label:expr, $value:expr, $value_color:expr, clickable: $click:expr) => {{
         let __cx = $cx;
-        h_flex()
-            .gap_2()
-            .items_baseline()
+        let __base = h_flex()
+            .id($id)
+            .gap_3()
+            .items_center()
+            .px_4()
+            .py_2()
+            .min_w(px(150.))
+            .rounded_lg()
+            .border_1()
+            .border_color(__cx.theme().border)
+            .bg(__cx.theme().secondary.opacity(0.4))
             .child(
                 div()
-                    .text_xs()
-                    .text_color(__cx.theme().muted_foreground)
-                    .child($label.to_string()),
+                    .size(px(30.))
+                    .rounded_md()
+                    .bg($icon_color.opacity(0.15))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(svg_icon($icon, $icon_color, 16.)),
             )
-            .child(div().text_sm().text_color($color).child($value))
+            .child(
+                v_flex()
+                    .gap_0p5()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(__cx.theme().muted_foreground)
+                            .child($label.to_string()),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color($value_color)
+                            .child($value),
+                    ),
+            );
+        if $click {
+            __base.hover(|this| this.bg(__cx.theme().secondary.opacity(0.7)))
+        } else {
+            __base
+        }
     }};
 }
+
 impl ThermiteApp {
-    fn render_headline(&self, cx: &Context<Self>) -> impl IntoElement {
+    /// "System overview" title + machine subtitle, with the right-hand
+    /// status chips (Profile / Power / Failsafe).
+    fn render_header(&self, cx: &Context<Self>) -> impl IntoElement {
         let (profile, power, phase, grace) = match &self.status {
             Some(s) => (
                 s.telemetry.platform_profile.clone().unwrap_or("—".into()),
@@ -385,82 +524,218 @@ impl ThermiteApp {
             None => ("—".into(), "—".into(), FailsafePhase::Normal, false),
         };
         h_flex()
-            .gap_6()
-            .px_2()
-            .py_1()
-            .items_center()
-            .child(chip!(cx, "profile", profile, cx.theme().accent))
-            .child(chip!(cx, "power", power, cx.theme().blue))
-            .child(chip!(
-                cx,
-                "failsafe",
-                match phase {
-                    FailsafePhase::Normal => "normal".to_string(),
-                    FailsafePhase::ForceFull => "FORCE FULL".to_string(),
-                    FailsafePhase::ReleasedAuto => "RELEASED TO FIRMWARE".to_string(),
-                },
-                match phase {
-                    FailsafePhase::Normal => cx.theme().green,
-                    _ => cx.theme().red,
-                }
-            ))
-            .when(grace, |this| {
-                this.child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().yellow)
-                        .child("post-resume grace"),
-                )
-            })
+            .justify_between()
+            .items_start()
+            .child(
+                v_flex()
+                    .gap_0p5()
+                    .child(
+                        div()
+                            .text_2xl()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(cx.theme().foreground)
+                            .child("System overview"),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(self.machine.product.clone())
+                            .child("·")
+                            .child(self.machine.os.clone())
+                            .when(grace, |this| {
+                                this.child(
+                                    div()
+                                        .text_xs()
+                                        .px_2()
+                                        .py_0p5()
+                                        .rounded_md()
+                                        .bg(cx.theme().yellow.opacity(0.15))
+                                        .text_color(cx.theme().yellow)
+                                        .child("post-resume grace"),
+                                )
+                            }),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .gap_3()
+                    .child(
+                        status_chip!(
+                            cx,
+                            "chip-profile",
+                            icons::LAYERS,
+                            cx.theme().accent,
+                            "Profile",
+                            profile,
+                            cx.theme().accent,
+                            clickable: true
+                        )
+                        .on_click(cx.listener(|this, _ev: &ClickEvent, _window, cx| {
+                            this.nav = Nav::Profiles;
+                            cx.notify();
+                        })),
+                    )
+                    .child(status_chip!(
+                        cx,
+                        "chip-power",
+                        icons::ZAP,
+                        cx.theme().yellow,
+                        "Power",
+                        power,
+                        cx.theme().foreground,
+                        clickable: false
+                    ))
+                    .child(status_chip!(
+                        cx,
+                        "chip-failsafe",
+                        icons::SHIELD_CHECK,
+                        match phase {
+                            FailsafePhase::Normal => cx.theme().green,
+                            _ => cx.theme().red,
+                        },
+                        "Failsafe",
+                        match phase {
+                            FailsafePhase::Normal => "Normal".to_string(),
+                            FailsafePhase::ForceFull => "Force full".to_string(),
+                            FailsafePhase::ReleasedAuto => "Released to firmware".to_string(),
+                        },
+                        match phase {
+                            FailsafePhase::Normal => cx.theme().green,
+                            _ => cx.theme().red,
+                        },
+                        clickable: false
+                    )),
+            )
     }
 
-    fn render_chart(
+    /// One metric card: icon + title header, big current value, area chart
+    /// with a fixed y-domain, grid and axis labels (mockup style).
+    fn render_metric_card(
         &self,
+        id: &'static str,
         title: &str,
-        unit: &str,
+        icon: &'static str,
+        icon_color: Hsla,
+        unit: &'static str,
         data: &[Sample],
         value_fn: impl Fn(&Sample) -> f64 + 'static,
+        y_domain: (f64, f64),
         color: Hsla,
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let owned: Vec<Sample> = data.to_vec();
         let last = owned.last().map(&value_fn).unwrap_or(0.0);
+        let domain = y_domain;
         v_flex()
-            .min_h(px(150.))
+            .id(id)
             .flex_1()
-            .gap_1()
+            .gap_2()
             .border_1()
             .border_color(cx.theme().border)
-            .rounded_md()
-            .p_2()
+            .rounded_lg()
+            .bg(cx.theme().secondary.opacity(0.35))
+            .p_4()
+            .min_h(px(190.))
             .child(
                 h_flex()
                     .justify_between()
-                    .px_1()
+                    .items_center()
                     .child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().foreground)
-                            .child(title.to_string()),
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(svg_icon(icon, icon_color, 16.))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(cx.theme().foreground)
+                                    .child(title.to_string()),
+                            ),
                     )
                     .child(
-                        div()
-                            .text_sm()
-                            .text_color(color)
-                            .child(format!("{last:.0}{unit}")),
+                        h_flex()
+                            .items_baseline()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_2xl()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(color)
+                                    .child(format!("{last:.0}")),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(unit),
+                            ),
                     ),
             )
             .child(
-                AreaChart::new(owned)
-                    .x(|d: &Sample| format!("{:.0}s", d.t))
-                    .y(value_fn)
-                    .stroke(color)
-                    .fill(linear_gradient(
-                        0.,
-                        linear_color_stop(color.opacity(0.35), 1.),
-                        linear_color_stop(cx.theme().background.opacity(0.05), 0.),
-                    ))
-                    .tick_margin(12),
+                div().flex_1().child(
+                    AreaChart::new(owned)
+                        .x(|d: &Sample| format!("{:.0}s", d.t))
+                        .y(value_fn)
+                        .y_domain(domain.0, domain.1)
+                        .y_axis(true)
+                        .y_tick_count(5)
+                        .y_tick_format(move |v| format!("{v:.0}{unit}"))
+                        .x_tick_count(8)
+                        .grid(true)
+                        .grid_dashed(true)
+                        .stroke(color)
+                        .fill(linear_gradient(
+                            0.,
+                            linear_color_stop(color.opacity(0.35), 1.),
+                            linear_color_stop(cx.theme().secondary.opacity(0.05), 0.),
+                        ))
+                        .tick_margin(8),
+                ),
+            )
+    }
+
+    /// One row of the sensor table.
+    fn sensor_row(
+        label: &str,
+        class: &'static str,
+        temp: f32,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        h_flex()
+            .px_3()
+            .py_1p5()
+            .rounded_sm()
+            .text_sm()
+            .hover(|this| this.bg(cx.theme().secondary.opacity(0.6)))
+            .child(
+                div()
+                    .flex_1()
+                    .text_color(cx.theme().foreground)
+                    .truncate()
+                    .child(format!("{label} ({class})")),
+            )
+            .child(
+                div()
+                    .w(px(150.))
+                    .text_color(cx.theme().muted_foreground)
+                    .child(class.to_string()),
+            )
+            .child(
+                div()
+                    .w(px(90.))
+                    .text_right()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(if temp > 85.0 {
+                        cx.theme().red
+                    } else if temp > 70.0 {
+                        cx.theme().yellow
+                    } else {
+                        cx.theme().green
+                    })
+                    .child(format!("{temp:.1}°C")),
             )
     }
 
@@ -474,87 +749,119 @@ impl ThermiteApp {
         temps.sort_by(|a, b| b.temp_c.total_cmp(&a.temp_c));
 
         v_flex()
-            .p_4()
-            .gap_4()
+            .p_5()
+            .gap_5()
             .flex_1()
-            .child(self.render_headline(cx))
+            .child(self.render_header(cx))
             .child(
-                h_flex()
-                    .gap_4()
-                    .flex_none()
-                    .child(self.render_chart(
-                        "CPU temperature",
-                        "°C",
-                        &samples,
-                        |d| d.cpu,
-                        CPU_COLOR,
-                        cx,
-                    ))
-                    .child(self.render_chart(
-                        "GPU temperature",
-                        "°C",
-                        &samples,
-                        |d| d.gpu,
-                        GPU_COLOR,
-                        cx,
-                    )),
+                v_flex().gap_4().child(
+                    h_flex()
+                        .gap_4()
+                        .child(self.render_metric_card(
+                            "chart-cpu-temp",
+                            "CPU temperature",
+                            icons::THERMOMETER,
+                            CPU_COLOR,
+                            "°C",
+                            &samples,
+                            |d| d.cpu,
+                            (0.0, 100.0),
+                            CPU_COLOR,
+                            cx,
+                        ))
+                        .child(self.render_metric_card(
+                            "chart-gpu-temp",
+                            "GPU temperature",
+                            icons::THERMOMETER,
+                            GPU_COLOR,
+                            "°C",
+                            &samples,
+                            |d| d.gpu,
+                            (0.0, 100.0),
+                            GPU_COLOR,
+                            cx,
+                        )),
+                ),
             )
             .child(
                 h_flex()
                     .gap_4()
-                    .flex_none()
-                    .child(self.render_chart(
+                    .child(self.render_metric_card(
+                        "chart-cpu-fan",
                         "CPU fan",
+                        icons::FAN,
+                        FAN_COLOR,
                         "rpm",
                         &samples,
                         |d| d.cpu_rpm,
-                        CPU_RPM_COLOR,
+                        (0.0, 6000.0),
+                        FAN_COLOR,
                         cx,
                     ))
-                    .child(self.render_chart(
+                    .child(self.render_metric_card(
+                        "chart-gpu-fan",
                         "GPU fan",
+                        icons::FAN,
+                        FAN_COLOR_DIM,
                         "rpm",
                         &samples,
                         |d| d.gpu_rpm,
-                        GPU_RPM_COLOR,
+                        (0.0, 6000.0),
+                        FAN_COLOR_DIM,
                         cx,
                     )),
             )
             .child(
+                // Sensors table card
                 v_flex()
-                    .gap_1()
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .rounded_lg()
+                    .bg(cx.theme().secondary.opacity(0.35))
+                    .pb_2()
                     .child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child("sensors (hottest first)"),
-                    )
-                    .children(temps.iter().take(10).map(|t| {
                         h_flex()
                             .justify_between()
-                            .px_2()
-                            .py_1()
-                            .rounded_sm()
-                            .hover(|this| this.bg(cx.theme().accent.opacity(0.06)))
+                            .items_center()
+                            .px_4()
+                            .py_3()
                             .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(cx.theme().foreground)
-                                    .child(format!("{} ({})", t.label, temp_class_str(t.class))),
+                                h_flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .child(svg_icon(icons::THERMOMETER, cx.theme().red, 16.))
+                                    .child(
+                                        div()
+                                            .text_sm()
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(cx.theme().foreground)
+                                            .child("Sensors (hottest first)"),
+                                    ),
                             )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(if t.temp_c > 85.0 {
-                                        cx.theme().red
-                                    } else if t.temp_c > 70.0 {
-                                        cx.theme().yellow
-                                    } else {
-                                        cx.theme().green
-                                    })
-                                    .child(format!("{:.1}°C", t.temp_c)),
-                            )
-                    })),
+                            .child(svg_icon(icons::LIST_FILTER, cx.theme().muted_foreground, 14.)),
+                    )
+                    .child(
+                        // Column headers
+                        h_flex()
+                            .px_3()
+                            .pb_1p5()
+                            .mx_1()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .border_b_1()
+                            .border_color(cx.theme().border)
+                            .child(div().flex_1().child("Sensor"))
+                            .child(div().w(px(150.)).child("Source"))
+                            .child(div().w(px(90.)).text_right().child("Temperature")),
+                    )
+                    .children(
+                        temps
+                            .iter()
+                            .take(10)
+                            .map(|t| {
+                                Self::sensor_row(&t.label, temp_class_str(t.class), t.temp_c, cx)
+                            }),
+                    ),
             )
     }
 
@@ -1051,15 +1358,15 @@ impl ThermiteApp {
         let ok_color = cx.theme().green;
         let err_color = cx.theme().red;
         h_flex()
-            .px_4()
-            .gap_4()
-            .h_8()
+            .px_5()
+            .gap_3()
+            .h(px(36.))
             .flex_none()
             .items_center()
             .justify_between()
             .border_t_1()
-            .border_color(cx.theme().border)
-            .bg(cx.theme().tab_bar)
+            .border_color(cx.theme().status_bar_border)
+            .bg(cx.theme().status_bar)
             .text_xs()
             .text_color(cx.theme().muted_foreground)
             .child(
@@ -1070,30 +1377,56 @@ impl ThermiteApp {
                         CapabilityLevel::MonitorProfiles => "monitoring + profiles".to_string(),
                         CapabilityLevel::None => "no fan interface".to_string(),
                     })
+                    .child("·")
                     .child(format!("{}", self.socket.display())),
             )
-            .child(h_flex().gap_2().when_some(toast_msg, |this, msg| {
-                this.text_color(if toast_err.unwrap_or(false) {
-                    err_color
-                } else {
-                    ok_color
-                })
-                .child(msg)
-            }))
+            .child(h_flex().gap_2().items_center().when_some(
+                toast_msg,
+                |this, msg| {
+                    this.text_color(if toast_err.unwrap_or(false) {
+                        err_color
+                    } else {
+                        ok_color
+                    })
+                    .child(
+                        div()
+                            .size(px(6.))
+                            .rounded_full()
+                            .bg(if toast_err.unwrap_or(false) {
+                                err_color
+                            } else {
+                                ok_color
+                            }),
+                    )
+                    .child(msg)
+                },
+            ))
     }
 
     fn render_alerts_panel(&self, cx: &Context<Self>) -> impl IntoElement {
         let recent: Vec<Alert> = self.alerts.iter().rev().take(3).cloned().collect();
-        v_flex().gap_1().px_4().children(recent.iter().map(|a| {
-            div()
-                .text_xs()
-                .text_color(if a.level == AlertLevel::Critical {
+        if recent.is_empty() {
+            return v_flex().into_any_element();
+        }
+        v_flex()
+            .px_5()
+            .pb_2()
+            .gap_1()
+            .children(recent.iter().map(|a| {
+                let color = if a.level == AlertLevel::Critical {
                     cx.theme().red
                 } else {
                     cx.theme().yellow
-                })
-                .child(format!("{:?}: {}", a.kind, a.message))
-        }))
+                };
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .text_xs()
+                    .text_color(color)
+                    .child(svg_icon(icons::SHIELD_CHECK, color, 12.))
+                    .child(format!("{:?}: {}", a.kind, a.message))
+            }))
+            .into_any_element()
     }
 }
 
@@ -1120,15 +1453,7 @@ impl Render for ThermiteApp {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .size_full()
-            .child(
-                TitleBar::new().child(
-                    div()
-                        .ml_2()
-                        .text_sm()
-                        .text_color(cx.theme().foreground)
-                        .child("Thermite"),
-                ),
-            )
+            .child(TitleBar::new())
             .bg(cx.theme().background)
             .child(
                 h_flex()
