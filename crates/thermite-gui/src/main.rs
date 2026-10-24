@@ -12,7 +12,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use gpui_kit::component::chart::AreaChart;
-use gpui_kit::component::{h_flex, v_flex, ActiveTheme, Icon, Theme, ThemeMode, TitleBar};
+use gpui_kit::component::{h_flex, v_flex, Icon, Theme, ThemeMode, TitleBar};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use thermite_core::config::{Config, FanConfig, FanModeKind};
@@ -73,11 +73,35 @@ impl MachineInfo {
 /// Samples kept for charts (at 1 Hz ≈ 4 minutes).
 const MAX_SAMPLES: usize = 240;
 
-/// Palette for the metric cards (mockup: orange CPU, violet GPU, cyan fans).
-const CPU_COLOR: Hsla = hsla(0.066, 0.9, 0.6, 1.0); // orange
-const GPU_COLOR: Hsla = hsla(0.75, 0.6, 0.68, 1.0); // violet
-const FAN_COLOR: Hsla = hsla(0.52, 0.85, 0.62, 1.0); // cyan
-const FAN_COLOR_DIM: Hsla = hsla(0.52, 0.7, 0.5, 1.0); // dimmer cyan
+/// Monochrome design tokens: deep black background, charcoal surfaces,
+/// subtle gray borders, white typography, restrained red accent.
+mod ui {
+    use gpui_kit::{hsla, Hsla};
+
+    /// App background.
+    pub const BG: Hsla = hsla(0., 0., 0.04, 1.);
+    /// Card / pill surface.
+    pub const SURFACE: Hsla = hsla(0., 0., 0.075, 1.);
+    /// Hover / icon-tile surface.
+    pub const SURFACE_RAISED: Hsla = hsla(0., 0., 0.12, 1.);
+    /// Hairline borders.
+    pub const BORDER: Hsla = hsla(0., 0., 0.15, 1.);
+    /// Primary text.
+    pub const TEXT: Hsla = hsla(0., 0., 0.95, 1.);
+    /// Secondary text.
+    pub const TEXT_MUTED: Hsla = hsla(0., 0., 0.62, 1.);
+    /// Tertiary text (eyebrows, axis hints).
+    pub const TEXT_FAINT: Hsla = hsla(0., 0., 0.42, 1.);
+    /// Red accent: active states, thermal warnings, the CPU metric.
+    pub const ACCENT: Hsla = hsla(0.008, 0.78, 0.56, 1.);
+    /// Accent at low alpha: active nav, selected chips.
+    pub const ACCENT_DIM: Hsla = hsla(0.008, 0.78, 0.56, 0.13);
+    /// OK state (failsafe normal, daemon online dot).
+    pub const OK: Hsla = hsla(0.4, 0.55, 0.52, 1.);
+    /// Soft warning (battery, post-resume grace).
+    pub const WARN: Hsla = hsla(0.09, 0.85, 0.62, 1.);
+}
+use ui::{ACCENT, ACCENT_DIM, BG, BORDER, OK, SURFACE, SURFACE_RAISED, TEXT, TEXT_FAINT, TEXT_MUTED, WARN};
 
 /// One telemetry sample for the charts.
 #[derive(Clone)]
@@ -213,17 +237,14 @@ impl ThermiteApp {
 
     fn apply_event(&mut self, ev: IpcEvent) {
         match ev {
+            // Connection state is already visible in the sidebar pill; no
+            // status-bar toast for it.
             IpcEvent::Connected => {
                 self.connected = true;
-                self.toast = Some(("daemon connected".to_string(), false));
             }
             IpcEvent::Disconnected => {
                 self.connected = false;
                 self.status = None;
-                self.toast = Some((
-                    "daemon lost — is thermite.service running?".to_string(),
-                    true,
-                ));
             }
             IpcEvent::Tick(status) => {
                 let telemetry = &status.telemetry; // Box deref
@@ -362,8 +383,8 @@ impl ThermiteApp {
             .h_full()
             .flex_none()
             .border_r_1()
-            .border_color(cx.theme().sidebar_border)
-            .bg(cx.theme().sidebar)
+            .border_color(BORDER)
+            .bg(BG)
             .child(
                 // Brand
                 h_flex()
@@ -371,12 +392,12 @@ impl ThermiteApp {
                     .items_center()
                     .px_5()
                     .h(px(56.))
-                    .child(svg_icon(icons::FLAME, CPU_COLOR, 20.))
+                    .child(svg_icon(icons::FLAME, ACCENT, 20.))
                     .child(
                         div()
                             .text_base()
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(cx.theme().sidebar_foreground)
+                            .text_color(TEXT)
                             .child("Thermite"),
                     ),
             )
@@ -394,14 +415,14 @@ impl ThermiteApp {
                     .rounded_md()
                     .text_sm()
                     .when(active, |this| {
-                        this.bg(cx.theme().sidebar_accent)
-                            .text_color(cx.theme().sidebar_accent_foreground)
+                        this.bg(ACCENT_DIM)
+                            .text_color(TEXT)
                     })
                     .when(!active, |this| {
-                        this.text_color(cx.theme().sidebar_foreground.opacity(0.75))
+                        this.text_color(TEXT_MUTED)
                             .hover(|this| {
-                                this.bg(cx.theme().sidebar_accent.opacity(0.5))
-                                    .text_color(cx.theme().sidebar_foreground)
+                                this.bg(SURFACE_RAISED)
+                                    .text_color(TEXT)
                             })
                     })
                     .on_click(cx.listener(move |this, _ev: &ClickEvent, _window, cx| {
@@ -409,9 +430,9 @@ impl ThermiteApp {
                         cx.notify();
                     }))
                     .child(svg_icon(nav.icon(), if active {
-                        cx.theme().sidebar_accent_foreground
+                        TEXT
                     } else {
-                        cx.theme().sidebar_foreground.opacity(0.6)
+                        TEXT_MUTED
                     }, 16.))
                     .child(label.to_string())
             }))
@@ -427,21 +448,21 @@ impl ThermiteApp {
                     .py_2()
                     .rounded_md()
                     .when(self.connected, |this| {
-                        this.bg(cx.theme().green.opacity(0.1))
-                            .text_color(cx.theme().green)
+                        this.bg(SURFACE)
+                            .text_color(OK)
                     })
                     .when(!self.connected, |this| {
-                        this.bg(cx.theme().red.opacity(0.1))
-                            .text_color(cx.theme().red)
+                        this.bg(SURFACE)
+                            .text_color(ACCENT)
                     })
                     .child(
                         div()
                             .size(px(8.))
                             .rounded_full()
                             .bg(if self.connected {
-                                cx.theme().green
+                                OK
                             } else {
-                                cx.theme().red
+                                ACCENT
                             }),
                     )
                     .child(
@@ -469,13 +490,13 @@ macro_rules! status_chip {
             .min_w(px(150.))
             .rounded_lg()
             .border_1()
-            .border_color(__cx.theme().border)
-            .bg(__cx.theme().secondary.opacity(0.4))
+            .border_color(BORDER)
+            .bg(SURFACE)
             .child(
                 div()
                     .size(px(30.))
                     .rounded_md()
-                    .bg($icon_color.opacity(0.15))
+                    .bg($icon_color.opacity(0.22))
                     .flex()
                     .items_center()
                     .justify_center()
@@ -487,7 +508,7 @@ macro_rules! status_chip {
                     .child(
                         div()
                             .text_xs()
-                            .text_color(__cx.theme().muted_foreground)
+                            .text_color(TEXT_MUTED)
                             .child($label.to_string()),
                     )
                     .child(
@@ -499,7 +520,7 @@ macro_rules! status_chip {
                     ),
             );
         if $click {
-            __base.hover(|this| this.bg(__cx.theme().secondary.opacity(0.7)))
+            __base.hover(|this| this.bg(SURFACE_RAISED))
         } else {
             __base
         }
@@ -528,22 +549,29 @@ impl ThermiteApp {
             .items_start()
             .child(
                 v_flex()
-                    .gap_0p5()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(TEXT_FAINT)
+                            .child("SYSTEM OVERVIEW"),
+                    )
                     .child(
                         div()
                             .text_2xl()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(cx.theme().foreground)
-                            .child("System overview"),
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(TEXT)
+                            .child(self.machine.product.clone()),
                     )
                     .child(
                         h_flex()
                             .gap_2()
                             .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(self.machine.product.clone())
-                            .child("·")
+                            .text_color(TEXT_MUTED)
                             .child(self.machine.os.clone())
+                            .child("·")
+                            .child(format!("Thermite v{}", env!("CARGO_PKG_VERSION")))
                             .when(grace, |this| {
                                 this.child(
                                     div()
@@ -551,8 +579,8 @@ impl ThermiteApp {
                                         .px_2()
                                         .py_0p5()
                                         .rounded_md()
-                                        .bg(cx.theme().yellow.opacity(0.15))
-                                        .text_color(cx.theme().yellow)
+                                        .bg(WARN.opacity(0.15))
+                                        .text_color(WARN)
                                         .child("post-resume grace"),
                                 )
                             }),
@@ -566,10 +594,10 @@ impl ThermiteApp {
                             cx,
                             "chip-profile",
                             icons::LAYERS,
-                            cx.theme().accent,
+                            TEXT_MUTED,
                             "Profile",
                             profile,
-                            cx.theme().accent,
+                            TEXT,
                             clickable: true
                         )
                         .on_click(cx.listener(|this, _ev: &ClickEvent, _window, cx| {
@@ -581,10 +609,10 @@ impl ThermiteApp {
                         cx,
                         "chip-power",
                         icons::ZAP,
-                        cx.theme().yellow,
+                        TEXT,
                         "Power",
                         power,
-                        cx.theme().foreground,
+                        TEXT,
                         clickable: false
                     ))
                     .child(status_chip!(
@@ -592,8 +620,8 @@ impl ThermiteApp {
                         "chip-failsafe",
                         icons::SHIELD_CHECK,
                         match phase {
-                            FailsafePhase::Normal => cx.theme().green,
-                            _ => cx.theme().red,
+                            FailsafePhase::Normal => OK,
+                            _ => ACCENT,
                         },
                         "Failsafe",
                         match phase {
@@ -602,8 +630,8 @@ impl ThermiteApp {
                             FailsafePhase::ReleasedAuto => "Released to firmware".to_string(),
                         },
                         match phase {
-                            FailsafePhase::Normal => cx.theme().green,
-                            _ => cx.theme().red,
+                            FailsafePhase::Normal => OK,
+                            _ => ACCENT,
                         },
                         clickable: false
                     )),
@@ -611,31 +639,35 @@ impl ThermiteApp {
     }
 
     /// One metric card: icon + title header, big current value, area chart
-    /// with a fixed y-domain, grid and axis labels (mockup style).
+    /// with a fixed y-domain, grid and axis labels (mockup style). `ticks`
+    /// is the number of labels (intervals = ticks - 1).
     fn render_metric_card(
         &self,
         id: &'static str,
         title: &str,
         icon: &'static str,
         icon_color: Hsla,
+        value_color: Hsla,
+        line_color: Hsla,
         unit: &'static str,
         data: &[Sample],
         value_fn: impl Fn(&Sample) -> f64 + 'static,
         y_domain: (f64, f64),
-        color: Hsla,
-        cx: &Context<Self>,
+        ticks: usize,
+        _cx: &Context<Self>,
     ) -> impl IntoElement {
         let owned: Vec<Sample> = data.to_vec();
         let last = owned.last().map(&value_fn).unwrap_or(0.0);
         let domain = y_domain;
+        let intervals = (ticks.max(2) - 1) as f64;
         v_flex()
             .id(id)
             .flex_1()
             .gap_2()
             .border_1()
-            .border_color(cx.theme().border)
+            .border_color(BORDER)
             .rounded_lg()
-            .bg(cx.theme().secondary.opacity(0.35))
+            .bg(SURFACE)
             .p_4()
             .min_h(px(190.))
             .child(
@@ -651,7 +683,7 @@ impl ThermiteApp {
                                 div()
                                     .text_sm()
                                     .font_weight(FontWeight::MEDIUM)
-                                    .text_color(cx.theme().foreground)
+                                    .text_color(TEXT)
                                     .child(title.to_string()),
                             ),
                     )
@@ -663,80 +695,149 @@ impl ThermiteApp {
                                 div()
                                     .text_2xl()
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(color)
+                                    .text_color(value_color)
                                     .child(format!("{last:.0}")),
                             )
                             .child(
                                 div()
                                     .text_sm()
-                                    .text_color(cx.theme().muted_foreground)
+                                    .text_color(TEXT_MUTED)
                                     .child(unit),
                             ),
                     ),
             )
             .child(
-                div().flex_1().child(
-                    AreaChart::new(owned)
-                        .x(|d: &Sample| format!("{:.0}s", d.t))
-                        .y(value_fn)
-                        .y_domain(domain.0, domain.1)
-                        .y_axis(true)
-                        .y_tick_count(5)
-                        .y_tick_format(move |v| format!("{v:.0}{unit}"))
-                        .x_tick_count(8)
-                        .grid(true)
-                        .grid_dashed(true)
-                        .stroke(color)
-                        .fill(linear_gradient(
-                            0.,
-                            linear_color_stop(color.opacity(0.35), 1.),
-                            linear_color_stop(cx.theme().secondary.opacity(0.05), 0.),
-                        ))
-                        .tick_margin(8),
-                ),
+                h_flex()
+                    .flex_1()
+                    // h_flex centers children vertically by default, which
+                    // collapses the height-less AreaChart to zero — stretch
+                    // instead so the plot fills the row.
+                    .items_stretch()
+                    .gap_2()
+                    .child(
+                        div().flex_1().child(
+                            AreaChart::new(owned)
+                                .x(|d: &Sample| format!("{:.0}s", d.t))
+                                .y(value_fn)
+                                .y_domain(domain.0, domain.1)
+                                // The library's default 10px top headroom
+                                // skews the pixel-even grid off the domain
+                                // steps; zero padding keeps grid lines on
+                                // exact domain fractions.
+                                .y_padding(0., 0.)
+                                .x_tick_count(8)
+                                .grid(true)
+                                .grid_dashed(true)
+                                .stroke(line_color)
+                                .fill(linear_gradient(
+                                    0.,
+                                    linear_color_stop(line_color.opacity(0.22), 1.),
+                                    linear_color_stop(hsla(0., 0., 0.075, 0.), 0.),
+                                ))
+                                .tick_margin(8),
+                        ),
+                    )
+                    // Y labels on the right edge (mockup style): evenly
+                    // spaced domain values, aligned to the plot by skipping
+                    // the chart's 18px x-axis gutter at the bottom.
+                    .child(
+                        v_flex()
+                            .justify_between()
+                            .h_full()
+                            .pb(px(18.))
+                            .w(px(46.))
+                            .children((0..ticks.max(2)).map(|i| {
+                                let v =
+                                    domain.1 - (domain.1 - domain.0) * i as f64 / intervals;
+                                div()
+                                    .text_size(px(10.))
+                                    .text_right()
+                                    .text_color(TEXT_MUTED)
+                                    .child(format!("{v:.0}{unit}"))
+                            })),
+                    ),
             )
     }
 
     /// One row of the sensor table.
-    fn sensor_row(
-        label: &str,
-        class: &'static str,
-        temp: f32,
-        cx: &Context<Self>,
-    ) -> impl IntoElement {
+    fn sensor_row(label: &str, class: &'static str, temp: f32) -> impl IntoElement {
         h_flex()
             .px_3()
             .py_1p5()
             .rounded_sm()
             .text_sm()
-            .hover(|this| this.bg(cx.theme().secondary.opacity(0.6)))
+            .hover(|this| this.bg(SURFACE_RAISED))
             .child(
                 div()
                     .flex_1()
-                    .text_color(cx.theme().foreground)
+                    .text_color(TEXT)
                     .truncate()
                     .child(format!("{label} ({class})")),
             )
             .child(
                 div()
-                    .w(px(150.))
-                    .text_color(cx.theme().muted_foreground)
+                    .w(px(120.))
+                    .text_color(TEXT_MUTED)
                     .child(class.to_string()),
             )
             .child(
                 div()
-                    .w(px(90.))
+                    .w(px(80.))
                     .text_right()
                     .font_weight(FontWeight::MEDIUM)
-                    .text_color(if temp > 85.0 {
-                        cx.theme().red
-                    } else if temp > 70.0 {
-                        cx.theme().yellow
-                    } else {
-                        cx.theme().green
-                    })
+                    .text_color(if temp > 45.0 { ACCENT } else { TEXT })
                     .child(format!("{temp:.1}°C")),
             )
+    }
+
+    /// One sensors card: header + column headers + rows. Two of these sit
+    /// side by side (hottest half left, cooler half right).
+    fn render_sensor_card(title: &str, temps: &[thermite_core::TempTelemetry]) -> impl IntoElement {
+        v_flex()
+            .flex_1()
+            .border_1()
+            .border_color(BORDER)
+            .rounded_lg()
+            .bg(SURFACE)
+            .pb_2()
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .px_4()
+                    .py_3()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(svg_icon(icons::THERMOMETER, ACCENT, 16.))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(TEXT)
+                                    .child(title.to_string()),
+                            ),
+                    )
+                    .child(svg_icon(icons::LIST_FILTER, TEXT_MUTED, 14.)),
+            )
+            .child(
+                // Column headers
+                h_flex()
+                    .px_3()
+                    .pb_1p5()
+                    .mx_1()
+                    .text_xs()
+                    .text_color(TEXT_MUTED)
+                    .border_b_1()
+                    .border_color(BORDER)
+                    .child(div().flex_1().child("Sensor"))
+                    .child(div().w(px(120.)).child("Source"))
+                    .child(div().w(px(80.)).text_right().child("Temp")),
+            )
+            .children(temps.iter().map(|t| {
+                Self::sensor_row(&t.label, temp_class_str(t.class), t.temp_c)
+            }))
     }
 
     fn render_dashboard(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -753,115 +854,91 @@ impl ThermiteApp {
             .gap_5()
             .flex_1()
             .child(self.render_header(cx))
+            // Both chart rows flex-grow to absorb spare vertical space;
+            // items_stretch so the cards fill the row (h_flex would center
+            // and collapse them otherwise).
             .child(
-                v_flex().gap_4().child(
-                    h_flex()
-                        .gap_4()
-                        .child(self.render_metric_card(
-                            "chart-cpu-temp",
-                            "CPU temperature",
-                            icons::THERMOMETER,
-                            CPU_COLOR,
-                            "°C",
-                            &samples,
-                            |d| d.cpu,
-                            (0.0, 100.0),
-                            CPU_COLOR,
-                            cx,
-                        ))
-                        .child(self.render_metric_card(
-                            "chart-gpu-temp",
-                            "GPU temperature",
-                            icons::THERMOMETER,
-                            GPU_COLOR,
-                            "°C",
-                            &samples,
-                            |d| d.gpu,
-                            (0.0, 100.0),
-                            GPU_COLOR,
-                            cx,
-                        )),
-                ),
+                h_flex()
+                    .gap_4()
+                    .flex_1()
+                    .items_stretch()
+                    .child(self.render_metric_card(
+                        "chart-cpu-temp",
+                        "CPU temperature",
+                        icons::THERMOMETER,
+                        ACCENT,
+                        ACCENT,
+                        ACCENT,
+                        "°C",
+                        &samples,
+                        |d| d.cpu,
+                        (0.0, 100.0),
+                        5,
+                        cx,
+                    ))
+                    .child(self.render_metric_card(
+                        "chart-gpu-temp",
+                        "GPU temperature",
+                        icons::THERMOMETER,
+                        ACCENT,
+                        TEXT,
+                        TEXT.opacity(0.9),
+                        "°C",
+                        &samples,
+                        |d| d.gpu,
+                        (0.0, 100.0),
+                        5,
+                        cx,
+                    )),
             )
             .child(
                 h_flex()
                     .gap_4()
+                    .flex_1()
+                    .items_stretch()
                     .child(self.render_metric_card(
                         "chart-cpu-fan",
                         "CPU fan",
                         icons::FAN,
-                        FAN_COLOR,
+                        ACCENT,
+                        TEXT,
+                        TEXT.opacity(0.8),
                         "rpm",
                         &samples,
                         |d| d.cpu_rpm,
-                        (0.0, 6000.0),
-                        FAN_COLOR,
+                        (0.0, 8000.0),
+                        5,
                         cx,
                     ))
                     .child(self.render_metric_card(
                         "chart-gpu-fan",
                         "GPU fan",
                         icons::FAN,
-                        FAN_COLOR_DIM,
+                        ACCENT,
+                        TEXT,
+                        TEXT.opacity(0.8),
                         "rpm",
                         &samples,
                         |d| d.gpu_rpm,
-                        (0.0, 6000.0),
-                        FAN_COLOR_DIM,
+                        (0.0, 8000.0),
+                        5,
                         cx,
                     )),
             )
             .child(
-                // Sensors table card
-                v_flex()
-                    .border_1()
-                    .border_color(cx.theme().border)
-                    .rounded_lg()
-                    .bg(cx.theme().secondary.opacity(0.35))
-                    .pb_2()
-                    .child(
-                        h_flex()
-                            .justify_between()
-                            .items_center()
-                            .px_4()
-                            .py_3()
-                            .child(
-                                h_flex()
-                                    .gap_2()
-                                    .items_center()
-                                    .child(svg_icon(icons::THERMOMETER, cx.theme().red, 16.))
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .text_color(cx.theme().foreground)
-                                            .child("Sensors (hottest first)"),
-                                    ),
-                            )
-                            .child(svg_icon(icons::LIST_FILTER, cx.theme().muted_foreground, 14.)),
-                    )
-                    .child(
-                        // Column headers
-                        h_flex()
-                            .px_3()
-                            .pb_1p5()
-                            .mx_1()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .border_b_1()
-                            .border_color(cx.theme().border)
-                            .child(div().flex_1().child("Sensor"))
-                            .child(div().w(px(150.)).child("Source"))
-                            .child(div().w(px(90.)).text_right().child("Temperature")),
-                    )
-                    .children(
-                        temps
-                            .iter()
-                            .take(10)
-                            .map(|t| {
-                                Self::sensor_row(&t.label, temp_class_str(t.class), t.temp_c, cx)
-                            }),
-                    ),
+                // Sensors: two cards side by side — hottest half on the left
+                // so the ranking still reads naturally. 8 rows per card.
+                h_flex()
+                    .gap_4()
+                    .items_stretch()
+                    .child(Self::render_sensor_card(
+                        "Sensors (hottest first)",
+                        &temps[..temps.len().min(8)],
+                    ))
+                    .child(Self::render_sensor_card(
+                        "Sensors (continued)",
+                        &temps[temps.len().min(8)..temps.len().min(16)],
+                    )),
             )
     }
 
@@ -882,7 +959,7 @@ impl ThermiteApp {
             .flex_1()
             .gap_3()
             .border_1()
-            .border_color(cx.theme().border)
+            .border_color(BORDER)
             .rounded_md()
             .p_4()
             .child(
@@ -895,7 +972,7 @@ impl ThermiteApp {
                             .child(
                                 div()
                                     .text_sm()
-                                    .text_color(cx.theme().muted_foreground)
+                                    .text_color(TEXT_MUTED)
                                     .child(format!(
                                         "{} rpm",
                                         hw.and_then(|h| h.rpm)
@@ -906,7 +983,7 @@ impl ThermiteApp {
                             .child(
                                 div()
                                     .text_sm()
-                                    .text_color(cx.theme().muted_foreground)
+                                    .text_color(TEXT_MUTED)
                                     .child(format!(
                                         "hw {}",
                                         hw.and_then(|h| h.hw_mode).map(hw_mode_str).unwrap_or("—")
@@ -929,14 +1006,14 @@ impl ThermiteApp {
                             .text_sm()
                             .rounded_md()
                             .border_1()
-                            .border_color(cx.theme().border)
+                            .border_color(BORDER)
                             .when(active, |this| {
-                                this.bg(cx.theme().accent)
-                                    .text_color(cx.theme().accent_foreground)
+                                this.bg(ACCENT)
+                                    .text_color(TEXT)
                             })
                             .when(!active, |this| {
-                                this.text_color(cx.theme().foreground)
-                                    .hover(|this| this.bg(cx.theme().accent.opacity(0.1)))
+                                this.text_color(TEXT)
+                                    .hover(|this| this.bg(ACCENT_DIM))
                             })
                             .on_click(cx.listener(move |this, _ev: &ClickEvent, _window, cx| {
                                 let config = match kind {
@@ -975,7 +1052,7 @@ impl ThermiteApp {
                         .child(
                             div()
                                 .text_sm()
-                                .text_color(cx.theme().muted_foreground)
+                                .text_color(TEXT_MUTED)
                                 .child("duty"),
                         )
                         .children([("−5", -5i16), ("+5", 5), ("−15", -15), ("+15", 15)].map(
@@ -987,9 +1064,9 @@ impl ThermiteApp {
                                     .text_sm()
                                     .rounded_md()
                                     .border_1()
-                                    .border_color(cx.theme().border)
-                                    .text_color(cx.theme().foreground)
-                                    .hover(|this| this.bg(cx.theme().accent.opacity(0.1)))
+                                    .border_color(BORDER)
+                                    .text_color(TEXT)
+                                    .hover(|this| this.bg(ACCENT_DIM))
                                     .on_click(cx.listener(
                                         move |this, _ev: &ClickEvent, _window, cx| {
                                             let current = this
@@ -1015,7 +1092,7 @@ impl ThermiteApp {
                         .child(
                             div()
                                 .text_sm()
-                                .text_color(cx.theme().accent)
+                                .text_color(ACCENT)
                                 .child(format!("{manual_duty}%")),
                         ),
                 )
@@ -1034,14 +1111,14 @@ impl ThermiteApp {
                                 .text_sm()
                                 .rounded_md()
                                 .border_1()
-                                .border_color(cx.theme().border)
+                                .border_color(BORDER)
                                 .when(active, |this| {
-                                    this.bg(cx.theme().accent)
-                                        .text_color(cx.theme().accent_foreground)
+                                    this.bg(ACCENT)
+                                        .text_color(TEXT)
                                 })
                                 .when(!active, |this| {
-                                    this.text_color(cx.theme().foreground)
-                                        .hover(|this| this.bg(cx.theme().accent.opacity(0.1)))
+                                    this.text_color(TEXT)
+                                        .hover(|this| this.bg(ACCENT_DIM))
                                 })
                                 .on_click({
                                     let name = name.clone();
@@ -1079,8 +1156,8 @@ impl ThermiteApp {
                         .p_3()
                         .rounded_md()
                         .border_1()
-                        .border_color(cx.theme().yellow.opacity(0.5))
-                        .text_color(cx.theme().yellow)
+                        .border_color(WARN.opacity(0.5))
+                        .text_color(WARN)
                         .text_sm()
                         .child(
                             "Manual fan control unavailable at the current capability level — \
@@ -1125,14 +1202,14 @@ impl ThermiteApp {
                             .text_sm()
                             .rounded_md()
                             .border_1()
-                            .border_color(cx.theme().border)
+                            .border_color(BORDER)
                             .when(active, |this| {
-                                this.bg(cx.theme().accent)
-                                    .text_color(cx.theme().accent_foreground)
+                                this.bg(ACCENT)
+                                    .text_color(TEXT)
                             })
                             .when(!active, |this| {
-                                this.text_color(cx.theme().foreground)
-                                    .hover(|this| this.bg(cx.theme().accent.opacity(0.1)))
+                                this.text_color(TEXT)
+                                    .hover(|this| this.bg(ACCENT_DIM))
                             })
                             .on_click({
                                 let name = name.clone();
@@ -1152,7 +1229,7 @@ impl ThermiteApp {
                         .child(
                             div()
                                 .text_sm()
-                                .text_color(cx.theme().muted_foreground)
+                                .text_color(TEXT_MUTED)
                                 .child(format!(
                                     "{selected} — adjust points, then Save (temps strictly \
                                      increasing, duty 0-100)"
@@ -1165,19 +1242,19 @@ impl ThermiteApp {
                                 .px_2()
                                 .py_1()
                                 .rounded_sm()
-                                .hover(|this| this.bg(cx.theme().accent.opacity(0.06)))
+                                .hover(|this| this.bg(ACCENT_DIM))
                                 .child(
                                     div()
                                         .w(px(64.))
                                         .text_sm()
-                                        .text_color(cx.theme().muted_foreground)
+                                        .text_color(TEXT_MUTED)
                                         .child(format!("{:.0}°C", p.0)),
                                 )
                                 .child(
                                     div()
                                         .w(px(64.))
                                         .text_sm()
-                                        .text_color(cx.theme().accent)
+                                        .text_color(ACCENT)
                                         .child(format!("{}%", p.1)),
                                 )
                                 .child(
@@ -1199,9 +1276,9 @@ impl ThermiteApp {
                                                 .text_xs()
                                                 .rounded_sm()
                                                 .border_1()
-                                                .border_color(cx.theme().border)
+                                                .border_color(BORDER)
                                                 .hover(|this| {
-                                                    this.bg(cx.theme().accent.opacity(0.1))
+                                                    this.bg(ACCENT_DIM)
                                                 })
                                                 .on_click(cx.listener(
                                                     move |this, _ev: &ClickEvent, _window, cx| {
@@ -1223,9 +1300,9 @@ impl ThermiteApp {
                                             .text_xs()
                                             .rounded_sm()
                                             .border_1()
-                                            .border_color(cx.theme().border)
-                                            .text_color(cx.theme().red)
-                                            .hover(|this| this.bg(cx.theme().red.opacity(0.1)))
+                                            .border_color(BORDER)
+                                            .text_color(ACCENT)
+                                            .hover(|this| this.bg(SURFACE))
                                             .on_click(cx.listener(
                                                 move |this, _ev: &ClickEvent, _window, cx| {
                                                     this.delete_curve_point(i);
@@ -1247,8 +1324,8 @@ impl ThermiteApp {
                                         .text_sm()
                                         .rounded_md()
                                         .border_1()
-                                        .border_color(cx.theme().border)
-                                        .hover(|this| this.bg(cx.theme().accent.opacity(0.1)))
+                                        .border_color(BORDER)
+                                        .hover(|this| this.bg(ACCENT_DIM))
                                         .on_click(cx.listener(
                                             |this, _ev: &ClickEvent, _window, cx| {
                                                 this.add_curve_point();
@@ -1264,8 +1341,8 @@ impl ThermiteApp {
                                         .py_1()
                                         .text_sm()
                                         .rounded_md()
-                                        .bg(cx.theme().accent)
-                                        .text_color(cx.theme().accent_foreground)
+                                        .bg(ACCENT)
+                                        .text_color(TEXT)
                                         .hover(|this| this.opacity(0.9))
                                         .on_click(cx.listener(
                                             |this, _ev: &ClickEvent, _window, cx| {
@@ -1299,8 +1376,8 @@ impl ThermiteApp {
                         .p_3()
                         .rounded_md()
                         .border_1()
-                        .border_color(cx.theme().yellow.opacity(0.5))
-                        .text_color(cx.theme().yellow)
+                        .border_color(WARN.opacity(0.5))
+                        .text_color(WARN)
                         .text_sm()
                         .child(
                             "No platform profiles exposed by the firmware. Try `sudo modprobe \
@@ -1317,12 +1394,12 @@ impl ThermiteApp {
                     .rounded_md()
                     .border_1()
                     .border_color(if is_active {
-                        cx.theme().accent
+                        ACCENT
                     } else {
-                        cx.theme().border
+                        BORDER
                     })
-                    .when(is_active, |this| this.bg(cx.theme().accent.opacity(0.12)))
-                    .hover(|this| this.bg(cx.theme().accent.opacity(0.08)))
+                    .when(is_active, |this| this.bg(ACCENT_DIM))
+                    .hover(|this| this.bg(ACCENT_DIM))
                     .on_click({
                         let name = name.clone();
                         cx.listener(move |this, _ev: &ClickEvent, _window, cx| {
@@ -1340,7 +1417,7 @@ impl ThermiteApp {
                                 this.child(
                                     div()
                                         .text_sm()
-                                        .text_color(cx.theme().accent)
+                                        .text_color(ACCENT)
                                         .child("active"),
                                 )
                             }),
@@ -1348,15 +1425,15 @@ impl ThermiteApp {
             }))
     }
 
-    fn render_status_bar(&self, cx: &Context<Self>) -> impl IntoElement {
+    fn render_status_bar(&self) -> impl IntoElement {
         let cap = self
             .status
             .as_ref()
             .map(|s| s.daemon.capability.level)
             .unwrap_or(CapabilityLevel::None);
         let (toast_msg, toast_err) = self.toast.clone().unzip();
-        let ok_color = cx.theme().green;
-        let err_color = cx.theme().red;
+        let ok_color = TEXT_MUTED;
+        let err_color = ACCENT;
         h_flex()
             .px_5()
             .gap_3()
@@ -1365,10 +1442,10 @@ impl ThermiteApp {
             .items_center()
             .justify_between()
             .border_t_1()
-            .border_color(cx.theme().status_bar_border)
-            .bg(cx.theme().status_bar)
+            .border_color(BORDER)
+            .bg(BG)
             .text_xs()
-            .text_color(cx.theme().muted_foreground)
+            .text_color(TEXT_MUTED)
             .child(
                 h_flex()
                     .gap_3()
@@ -1403,7 +1480,7 @@ impl ThermiteApp {
             ))
     }
 
-    fn render_alerts_panel(&self, cx: &Context<Self>) -> impl IntoElement {
+    fn render_alerts_panel(&self) -> impl IntoElement {
         let recent: Vec<Alert> = self.alerts.iter().rev().take(3).cloned().collect();
         if recent.is_empty() {
             return v_flex().into_any_element();
@@ -1414,9 +1491,9 @@ impl ThermiteApp {
             .gap_1()
             .children(recent.iter().map(|a| {
                 let color = if a.level == AlertLevel::Critical {
-                    cx.theme().red
+                    ACCENT
                 } else {
-                    cx.theme().yellow
+                    WARN
                 };
                 h_flex()
                     .gap_2()
@@ -1454,7 +1531,7 @@ impl Render for ThermiteApp {
         v_flex()
             .size_full()
             .child(TitleBar::new())
-            .bg(cx.theme().background)
+            .bg(BG)
             .child(
                 h_flex()
                     .flex_1()
@@ -1473,8 +1550,8 @@ impl Render for ThermiteApp {
                             }),
                     ),
             )
-            .child(self.render_alerts_panel(cx))
-            .child(self.render_status_bar(cx))
+            .child(self.render_alerts_panel())
+            .child(self.render_status_bar())
     }
 }
 
