@@ -48,7 +48,7 @@ enum IpcEvent {
     /// Daemon went away.
     Disconnected,
     /// A tick arrived.
-    Tick(StatusSnapshot),
+    Tick(Box<StatusSnapshot>),
     /// Alert pushed.
     Alert(Alert),
     /// Config (re)loaded.
@@ -168,7 +168,7 @@ impl ThermiteApp {
                 ));
             }
             IpcEvent::Tick(status) => {
-                let telemetry = &status.telemetry;
+                let telemetry = &status.telemetry; // Box deref
                 self.samples.push_back(Sample {
                     t: status.daemon.uptime_ms as f64 / 1000.0,
                     cpu: telemetry.cpu_temp_c().map(f64::from).unwrap_or(0.0),
@@ -187,7 +187,7 @@ impl ThermiteApp {
                 while self.samples.len() > MAX_SAMPLES {
                     self.samples.pop_front();
                 }
-                self.status = Some(status);
+                self.status = Some(*status);
             }
             IpcEvent::Alert(alert) => {
                 if self.alerts.len() >= 64 {
@@ -702,7 +702,7 @@ impl ThermiteApp {
                                             cx.notify();
                                         },
                                     ))
-                                    .child(format!("{sym}"))
+                                    .child(sym.to_string())
                             },
                         ))
                         .child(
@@ -737,7 +737,6 @@ impl ThermiteApp {
                                         .hover(|this| this.bg(cx.theme().accent.opacity(0.1)))
                                 })
                                 .on_click({
-                                    let fan = fan;
                                     let name = name.clone();
                                     cx.listener(move |this, _ev: &ClickEvent, _window, cx| {
                                         this.send(GuiCommand::SetFan {
@@ -1048,7 +1047,7 @@ impl ThermiteApp {
             .as_ref()
             .map(|s| s.daemon.capability.level)
             .unwrap_or(CapabilityLevel::None);
-        let (toast_msg, toast_err) = self.toast.clone().map(|(m, e)| (m, e)).unzip();
+        let (toast_msg, toast_err) = self.toast.clone().unzip();
         let ok_color = cx.theme().green;
         let err_color = cx.theme().red;
         h_flex()
@@ -1184,7 +1183,7 @@ fn spawn_reader_thread(socket: PathBuf, tx: Sender<IpcEvent>) -> JoinHandle<()> 
                 };
                 if let Ok(Response::Status { status }) = client.call(Request::GetStatus) {
                     daemon = status.daemon.clone();
-                    tx.send(IpcEvent::Tick(status)).ok();
+                    tx.send(IpcEvent::Tick(Box::new(status))).ok();
                 }
                 if let Ok(Response::Config { config }) = client.call(Request::GetConfig) {
                     tx.send(IpcEvent::Config(Box::new(config))).ok();
@@ -1194,12 +1193,12 @@ fn spawn_reader_thread(socket: PathBuf, tx: Sender<IpcEvent>) -> JoinHandle<()> 
                         match client.read_event() {
                             Ok(Event::Tick { telemetry, control }) => {
                                 daemon.uptime_ms = daemon.uptime_ms.saturating_add(1000);
-                                tx.send(IpcEvent::Tick(StatusSnapshot {
+                                tx.send(IpcEvent::Tick(Box::new(StatusSnapshot {
                                     telemetry,
                                     control,
                                     daemon: daemon.clone(),
                                     recent_alerts: Vec::new(),
-                                }))
+                                })))
                                 .ok();
                             }
                             Ok(Event::Alert(a)) => {
@@ -1276,6 +1275,7 @@ fn main() {
         };
 
         let socket_for_window = socket.clone();
+        #[allow(clippy::expect_used)]
         gpui_kit::open_window(window_options, cx, move |window, cx| {
             window.activate_window();
             window.set_window_title("Thermite");

@@ -122,9 +122,8 @@ fn connect(socket: &Path) -> Result<Client> {
         &format!("thermite-cli {}", env!("CARGO_PKG_VERSION")),
     )
     .with_context(|| format!("connecting to daemon at {}", socket.display()))
-    .map_err(|e| {
+    .inspect_err(|_| {
         eprintln!("hint: is thermite-daemon running? Try `systemctl status thermite`.");
-        e
     })
 }
 
