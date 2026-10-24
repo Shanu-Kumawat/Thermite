@@ -171,6 +171,9 @@ pub struct StatusSnapshot {
     pub control: ControlSnapshot,
     /// Daemon metadata.
     pub daemon: DaemonInfo,
+    /// Most recent alerts (newest last, bounded).
+    #[serde(default)]
+    pub recent_alerts: Vec<Alert>,
 }
 
 /// Alert severity.

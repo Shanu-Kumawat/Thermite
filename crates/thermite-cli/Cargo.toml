@@ -15,6 +15,7 @@ thermite-proto = { workspace = true }
 thermite-backend = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 
 [lints]

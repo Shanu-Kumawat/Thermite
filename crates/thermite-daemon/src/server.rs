@@ -404,6 +404,7 @@ fn snapshot(guard: &SharedState) -> StatusSnapshot {
             dry_run: guard.dry_run,
             capability: guard.capability.clone(),
         },
+        recent_alerts: guard.alerts.iter().rev().take(10).rev().cloned().collect(),
     }
 }
 
