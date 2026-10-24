@@ -128,16 +128,36 @@ pub struct FansConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PlatformConfig {
-    /// Profile the daemon keeps applied; `None` leaves the firmware choice
-    /// untouched.
+    /// Profile the daemon keeps applied. `None` (written as
+    /// `active = "none"`, or by omitting the key) means Thermite never
+    /// touches platform profiles — for machines where power-profiles-daemon
+    /// or another tool owns them.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_profile_or_none",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub active: Option<PlatformProfile>,
 }
 
 impl Default for PlatformConfig {
     fn default() -> Self {
-        Self {
-            active: Some(PlatformProfile::Balanced),
-        }
+        Self { active: None }
+    }
+}
+
+/// Deserialize a profile name, mapping `"none"` (or an empty value) to
+/// hands-off mode.
+fn deserialize_profile_or_none<'de, D>(deserializer: D) -> Result<Option<PlatformProfile>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value: Option<String> = Option::deserialize(deserializer)?;
+    match value.as_deref() {
+        None | Some("none") | Some("") => Ok(None),
+        Some(name) => PlatformProfile::parse(name)
+            .map(Some)
+            .ok_or_else(|| serde::de::Error::custom(format!("unknown profile \"{name}\""))),
     }
 }
 
@@ -432,6 +452,41 @@ points = [[45, 20]]
     fn partial_config_gets_defaults() {
         let cfg = Config::from_toml_str("[fans.cpu]\nmode = \"auto\"\n").unwrap();
         assert_eq!(cfg.general.poll_interval_ms, 1000);
-        assert_eq!(cfg.platform.active, Some(PlatformProfile::Balanced));
+        // Hands-off by default: another tool (power-profiles-daemon) may own
+        // profiles.
+        assert_eq!(cfg.platform.active, None);
+    }
+
+    #[test]
+    fn platform_active_none_variants() {
+        assert_eq!(
+            Config::from_toml_str("[platform]\nactive = \"none\"\n")
+                .unwrap()
+                .platform
+                .active,
+            None
+        );
+        assert_eq!(
+            Config::from_toml_str("[platform]\nactive = \"\"\n")
+                .unwrap()
+                .platform
+                .active,
+            None
+        );
+        assert_eq!(
+            Config::from_toml_str("[platform]\nactive = \"quiet\"\n")
+                .unwrap()
+                .platform
+                .active,
+            Some(PlatformProfile::Quiet)
+        );
+        // Explicit value still round-trips through TOML persistence.
+        let cfg = Config::from_toml_str("[platform]\nactive = \"balanced\"\n").unwrap();
+        let out = cfg.to_toml_string().unwrap();
+        assert!(out.contains("\"balanced\""), "{out}");
+        // Hands-off serializes without the key.
+        let cfg = Config::from_toml_str("[platform]\nactive = \"none\"\n").unwrap();
+        let out = cfg.to_toml_string().unwrap();
+        assert!(!out.contains("active"), "{out}");
     }
 }

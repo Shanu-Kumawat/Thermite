@@ -270,6 +270,14 @@ fn handle_request(
         }
         Request::SetPlatformProfile { profile } => {
             let mut guard = shared.lock().map_err(|_| "state poisoned")?;
+            if guard.config.platform.active.is_none() {
+                return Err(
+                    "platform profiles are managed by another tool (config has [platform] \
+                     active = \"none\"); set an explicit profile in /etc/thermite/thermite.toml \
+                     to let Thermite manage them"
+                        .to_string(),
+                );
+            }
             if guard.capability.platform_profiles.is_empty() {
                 return Err("platform_profile interface absent; profiles unavailable".to_string());
             }
@@ -445,6 +453,7 @@ mod tests {
             &PersistedState::default(),
             false,
         );
+        st.config.platform.active = Some(thermite_core::PlatformProfile::Balanced);
         st.capability = CapabilityReport {
             level: CapabilityLevel::Full,
             platform_profiles: vec!["quiet".into(), "balanced".into()],

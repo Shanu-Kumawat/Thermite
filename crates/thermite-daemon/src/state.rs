@@ -129,10 +129,23 @@ impl SharedState {
                 )
             })
             .collect();
+        // Profile policy: hands-off when the config says so (another tool
+        // owns profiles); otherwise the config default applies, overridden
+        // by the user's persisted runtime choice. Both are normalized to
+        // canonical sysfs names.
+        let desired_profile = match config.platform.active {
+            None => None,
+            Some(default) => persisted
+                .platform_profile
+                .as_deref()
+                .and_then(thermite_core::PlatformProfile::parse)
+                .or(Some(default))
+                .map(|p| p.as_str().to_string()),
+        };
         Self {
             config,
             fans,
-            desired_profile: persisted.platform_profile.clone(),
+            desired_profile,
             profile_applied: false,
             profile_error: None,
             telemetry: Telemetry::default(),
