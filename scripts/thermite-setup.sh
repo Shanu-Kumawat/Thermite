@@ -87,7 +87,9 @@ sleep 2
 
 ACER_HWMON=""
 for d in /sys/class/hwmon/hwmon*; do
-    if [[ $(cat "$d/name" 2>/dev/null || true) == acer_wmi ]]; then ACER_HWMON=$d; fi
+    case $(cat "$d/name" 2>/dev/null || true) in
+        acer|acer_wmi) ACER_HWMON=$d ;;
+    esac
 done
 [[ -n $ACER_HWMON ]] || die "acer_wmi loaded but no hwmon appeared.
 Check: dmesg | grep -i acer_wmi (last 30 lines)"

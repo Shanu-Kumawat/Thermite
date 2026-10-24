@@ -260,6 +260,20 @@ mod tests {
     }
 
     #[test]
+    fn mainline_acer_hwmon_name_detected() {
+        // Mainline registers the hwmon as plain "acer".
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let h0 = root.join("sys/class/hwmon/hwmon0");
+        write(&h0.join("name"), "acer");
+        write(&h0.join("fan1_input"), "2400");
+        write(&h0.join("pwm1"), "128");
+        write(&h0.join("pwm1_enable"), "2");
+        let report = crate::capability::probe(&root);
+        assert_eq!(report.level, CapabilityLevel::Full);
+    }
+
+    #[test]
     fn telemetry_reads_fans_temps_profile() {
         let (_d, root) = full_fixture();
         let mut b = AcerWmiBackend::with_root(root);

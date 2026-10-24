@@ -4,8 +4,8 @@
 //!
 //! | Level | Trigger | Meaning |
 //! |---|---|---|
-//! | `Full` | hwmon `acer_wmi` has `pwm1_enable` | telemetry + manual fan control |
-//! | `MonitorProfiles` | hwmon `acer_wmi` exists, no `pwm1_enable` | telemetry + platform profiles only (`acer_wmi predator_v4=1`) |
+//! | `Full` | acer hwmon has `pwm1_enable` | telemetry + manual fan control |
+//! | `MonitorProfiles` | acer hwmon exists, no `pwm1_enable` | telemetry + platform profiles only (`acer_wmi predator_v4=1`) |
 //! | `None` | no hwmon | stock driver state; generic sensors still work |
 //!
 //! `Full` arrives with kernel ≥ 7.3 (upstream ANV15-51 quirk) or the
@@ -15,14 +15,21 @@ use std::path::{Path, PathBuf};
 
 use thermite_core::{CapabilityLevel, CapabilityReport};
 
-/// hwmon name registered by the mainline acer-wmi driver.
-pub const ACER_WMI_HWMON_NAME: &str = "acer_wmi";
+/// hwmon names the acer-wmi driver registers under. Mainline (v7.2 and
+/// pdx86 for-next) registers plain `"acer"`; `"acer_wmi"` is kept for
+/// community builds that rename it.
+pub const ACER_WMI_HWMON_NAMES: [&str; 2] = ["acer", "acer_wmi"];
+
+/// True when a hwmon name belongs to the acer-wmi driver.
+pub fn is_acer_hwmon_name(name: &str) -> bool {
+    ACER_WMI_HWMON_NAMES.contains(&name)
+}
 
 /// Locate the acer-wmi hwmon directory under `root`, if present.
 pub fn find_acer_hwmon(root: &Path) -> Option<PathBuf> {
     crate::sysfs::hwmon_dirs(root)
         .into_iter()
-        .find(|d| crate::sysfs::hwmon_name(d).as_deref() == Some(ACER_WMI_HWMON_NAME))
+        .find(|d| crate::sysfs::hwmon_name(d).is_some_and(|n| is_acer_hwmon_name(&n)))
 }
 
 /// Platform profile choices from
