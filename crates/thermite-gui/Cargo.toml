@@ -1,0 +1,19 @@
+[package]
+name = "thermite-gui"
+description = "Thermite desktop GUI (GPUI)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "thermite-gui"
+path = "src/main.rs"
+
+[dependencies]
+thermite-core = { workspace = true }
+thermite-proto = { workspace = true }
+anyhow = { workspace = true }
+gpui-kit = "0.7"
+
+[lints]
+workspace = true

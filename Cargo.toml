@@ -6,6 +6,7 @@ members = [
     "crates/thermite-backend",
     "crates/thermite-daemon",
     "crates/thermite-cli",
+    "crates/thermite-gui",
 ]
 
 [workspace.package]
