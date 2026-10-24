@@ -1,0 +1,30 @@
+[package]
+name = "thermite-daemon"
+description = "Thermite daemon: control loop, failsafes, UDS IPC server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "thermite-daemon"
+path = "src/main.rs"
+
+[dependencies]
+thermite-core = { workspace = true }
+thermite-proto = { workspace = true }
+thermite-backend = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+nix = { workspace = true }
+sd-notify = { workspace = true }
+zbus = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

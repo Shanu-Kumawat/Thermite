@@ -1,0 +1,21 @@
+[package]
+name = "thermite-cli"
+description = "Thermite command-line interface"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "thermite"
+path = "src/main.rs"
+
+[dependencies]
+thermite-core = { workspace = true }
+thermite-proto = { workspace = true }
+thermite-backend = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

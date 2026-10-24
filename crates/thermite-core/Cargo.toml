@@ -1,0 +1,17 @@
+[package]
+name = "thermite-core"
+description = "Pure thermal policy logic: fan curves, hysteresis, failsafes, config (no I/O)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

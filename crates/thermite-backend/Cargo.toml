@@ -1,0 +1,24 @@
+[package]
+name = "thermite-backend"
+description = "Hardware backends: acer-wmi sysfs, generic hwmon sensors, NVML, fakes for testing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thermite-core = { workspace = true }
+nvml-wrapper = { version = "0.11", optional = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+default = ["nvml"]
+# NVIDIA GPU telemetry via NVML (the proprietary driver's only API on this
+# machine; gracefully absent at runtime when the library is missing).
+nvml = ["dep:nvml-wrapper"]
+
+[lints]
+workspace = true

@@ -1,0 +1,45 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/thermite-core",
+    "crates/thermite-proto",
+    "crates/thermite-backend",
+    "crates/thermite-daemon",
+    "crates/thermite-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/shanu/thermite"
+
+[workspace.dependencies]
+thermite-core = { path = "crates/thermite-core" }
+thermite-proto = { path = "crates/thermite-proto" }
+thermite-backend = { path = "crates/thermite-backend" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+thiserror = "2"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+nix = { version = "0.30", features = ["socket", "user", "fs"] }
+sd-notify = "0.4"
+zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+dbg_macro = "deny"
+
+[profile.release]
+lto = "thin"
+strip = "debuginfo"
