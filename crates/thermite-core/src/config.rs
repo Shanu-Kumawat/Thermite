@@ -125,7 +125,7 @@ pub struct FansConfig {
 }
 
 /// Platform (performance) profile settings.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct PlatformConfig {
     /// Profile the daemon keeps applied. `None` (written as
@@ -138,12 +138,6 @@ pub struct PlatformConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub active: Option<PlatformProfile>,
-}
-
-impl Default for PlatformConfig {
-    fn default() -> Self {
-        Self { active: None }
-    }
 }
 
 /// Deserialize a profile name, mapping `"none"` (or an empty value) to
