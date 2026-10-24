@@ -79,17 +79,26 @@ else
 fi
 
 step "      Swapping in the patched driver (fans stay untouched)"
-if lsmod | grep -q '^acer_wmi '; then
-    modprobe -r acer_wmi || warn "could not unload acer_wmi (in use?) — reboot will pick the new module up"
-fi
-modprobe acer_wmi
-sleep 2
-
+# The first unload/reload after replacing the module file can silently
+# no-op on some setups; verify the hwmon appeared and retry a few times.
 ACER_HWMON=""
-for d in /sys/class/hwmon/hwmon*; do
-    case $(cat "$d/name" 2>/dev/null || true) in
-        acer|acer_wmi) ACER_HWMON=$d ;;
-    esac
+find_acer_hwmon() {
+    for d in /sys/class/hwmon/hwmon*; do
+        case $(cat "$d/name" 2>/dev/null || true) in
+            acer|acer_wmi) echo "$d"; return ;;
+        esac
+    done
+    true
+}
+for attempt in 1 2 3; do
+    if lsmod | grep -q '^acer_wmi '; then
+        modprobe -r acer_wmi || warn "could not unload acer_wmi (in use?)"
+    fi
+    modprobe acer_wmi
+    sleep 2
+    ACER_HWMON="$(find_acer_hwmon)"
+    [[ -n $ACER_HWMON ]] && break
+    warn "hwmon did not appear after swap attempt $attempt — retrying"
 done
 [[ -n $ACER_HWMON ]] || die "acer_wmi loaded but no hwmon appeared.
 Check: dmesg | grep -i acer_wmi (last 30 lines)"
