@@ -22,7 +22,7 @@ pub mod power;
 pub mod sysfs;
 
 pub use acer_wmi::AcerWmiBackend;
-pub use fake::FakeBackend;
+pub use fake::{FakeBackend, WriteOp};
 
 use thermite_core::{Backend, CapabilityReport, Telemetry};
 

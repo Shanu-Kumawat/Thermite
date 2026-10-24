@@ -25,7 +25,7 @@ pub mod sensors;
 
 pub use config::{Config, ConfigError, FanConfig, FanModeKind, GeneralConfig, PlatformConfig};
 pub use curve::{CurveDef, CurveError, CurvePoint};
-pub use failsafe::{FailsafePhase, FailsafeThresholds, PhaseDirective};
+pub use failsafe::{FailsafeEngine, FailsafePhase, FailsafeThresholds, PhaseDirective};
 pub use hysteresis::Hysteresis;
 pub use profile::PlatformProfile;
 pub use sensors::{
