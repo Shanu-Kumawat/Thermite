@@ -1,0 +1,10 @@
+*.ko
+*.o
+*.mod
+*.mod.c
+.modfiles
+.module-common.o
+.cache.mk
+.modules.order
+.symvers
+Makefile.new
