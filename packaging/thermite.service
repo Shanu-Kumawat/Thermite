@@ -1,0 +1,36 @@
+[Unit]
+Description=Thermite thermal management daemon (Acer Nitro V 15)
+Documentation=file:/usr/share/doc/thermite/SAFETY.md
+After=multi-user.target
+
+[Service]
+Type=notify
+ExecStart=/usr/bin/thermite-daemon
+# The daemon restores firmware-auto fan control itself on SIGTERM; no
+# ExecStop needed.
+WatchdogSec=30
+Restart=on-failure
+RestartSec=2
+# Failsafe writes are tiny but must never be OOM-killed mid-decision.
+OOMScoreAdjust=-1000
+Nice=-5
+StateDirectory=thermite
+RuntimeDirectory=thermite
+# The daemon reads/writes /sys (acer-wmi hwmon, platform_profile), its
+# config, and its state dir; nothing else.
+ReadWritePaths=/etc/thermite /var/lib/thermite
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

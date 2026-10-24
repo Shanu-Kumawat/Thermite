@@ -1,0 +1,61 @@
+# Thermite example configuration.
+#
+# The daemon works with no file at all (everything below is the default):
+# fans stay under firmware control until you explicitly set a mode, either
+# here or via `thermite fan ...` / the GUI (runtime changes are persisted to
+# /var/lib/thermite/state.json and override these defaults).
+#
+# Validate with: thermite config check /etc/thermite/thermite.toml
+
+[general]
+poll_interval_ms = 1000        # control loop period (200-10000)
+reassert_interval_ms = 2000    # rewrite mode+duty at least this often,
+                               # even unchanged (defeats firmware reverts)
+battery_curve_suffix = "-battery"  # fan on curve X uses X-battery on
+                                   # battery, if that curve exists
+
+[failsafe]
+cpu_warn_c = 87.0   # force both fans to 100%
+cpu_crit_c = 92.0   # hand control back to the firmware (auto), latch until
+                    # temps drop by recovery_c
+gpu_warn_c = 82.0
+gpu_crit_c = 87.0
+recovery_c = 5.0
+duty_floor_temp_c = 60.0  # above this temperature, duty is raised to at
+                          # least duty_floor_pct
+duty_floor_pct = 30
+zero_duty_max_c = 45.0    # never command 0% duty above this temperature
+min_spin_pct = 15
+
+[hysteresis]
+drop_c = 2.0        # after an upshift, temps must fall this far before a
+                    # downshift is considered
+hold_ticks = 5      # a lower duty must persist this many ticks to commit
+
+[fans.cpu]
+mode = "auto"       # "auto" | "manual" | "curve"
+# curve = "balanced"          # when mode = "curve"
+# manual_duty_pct = 40        # when mode = "manual"
+
+[fans.gpu]
+mode = "auto"
+
+[platform]
+active = "balanced"   # platform profile to keep applied; one of the
+                      # firmware's choices (see `thermite profile list`).
+                      # Set to omit to leave the firmware choice alone.
+
+# Named curves: strictly increasing temperatures, duty 0-100. A curve's last
+# point is held above its temperature; a single point is a constant duty.
+
+[curves.quiet]
+points = [[45, 25], [60, 35], [75, 55], [90, 100]]
+
+[curves.quiet-battery]
+points = [[50, 20], [65, 30], [78, 50], [92, 100]]
+
+[curves.balanced]
+points = [[40, 30], [55, 40], [65, 50], [75, 65], [85, 85], [95, 100]]
+
+[curves.performance]
+points = [[40, 40], [55, 55], [65, 70], [75, 85], [85, 100]]

@@ -1,0 +1,48 @@
+# PKGBUILD for thermite (AUR: thermite-git style; adjust source for releases)
+pkgname=thermite
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Thermal management for the Acer Nitro V 15 (ANV15-51): daemon, CLI, GPUI GUI"
+arch=('x86_64')
+url="https://github.com/shanu/thermite"
+license=('MIT')
+depends=('gcc-libs' 'systemd' 'polkit')
+makedepends=('cargo' 'clang' 'libxkbcommon' 'vulkan-icd-loader' 'wayland')
+optdepends=(
+  'vulkan-intel: GPU rendering for the GUI on Intel'
+  'nvidia-utils: GPU rendering for the GUI on NVIDIA + GPU telemetry'
+)
+backup=('etc/thermite/thermite.toml')
+source=("$pkgname-$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+prepare() {
+  cd "$pkgname-$pkgver"
+  export CARGO_HOME="$SRCDEST/cargo-home"
+  cargo fetch --locked --target "$CARCH-unknown-linux-gnu"
+}
+
+build() {
+  cd "$pkgname-$pkgver"
+  export CARGO_TARGET_DIR=target
+  cargo build --frozen --release -p thermite-daemon -p thermite-cli -p thermite-gui
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  install -Dm755 target/release/thermite-daemon -t "$pkgdir/usr/bin/"
+  install -Dm755 target/release/thermite       -t "$pkgdir/usr/bin/"
+  install -Dm755 target/release/thermite-gui   -t "$pkgdir/usr/bin/"
+
+  install -Dm644 packaging/thermite.service -t "$pkgdir/usr/lib/systemd/system/"
+  install -Dm644 packaging/sysusers.conf "$pkgdir/usr/lib/sysusers.d/thermite.conf"
+  install -Dm644 packaging/tmpfiles.conf "$pkgdir/usr/lib/tmpfiles.d/thermite.conf"
+
+  install -Dm600 examples/thermite.toml "$pkgdir/etc/thermite/thermite.toml"
+
+  install -Dm644 README.md docs/*.md -t "$pkgdir/usr/share/doc/thermite/"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/thermite/LICENSE" 2>/dev/null || true
+}
+
+# post_install: systemd-sysusers + tmpfiles are run automatically by pacman
+# hooks; remember: `sudo usermod -aG thermite $USER` for unprivileged clients.
