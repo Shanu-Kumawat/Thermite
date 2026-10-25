@@ -308,25 +308,25 @@ impl Config {
         let mk = |pts: &[(f32, u8)]| CurveDef {
             points: pts.iter().map(|&(t, d)| CurvePoint(t, d)).collect(),
         };
+        // Duty floors chosen so fans sit around ~4000 rpm at idle
+        // (50% duty ≈ 4k rpm on the ANV15-51's ~8000 rpm max). All curves
+        // share the same five temperature steps so presets are comparable.
         let mut curves = BTreeMap::new();
         curves.insert(
             "quiet".to_string(),
-            mk(&[(45.0, 25), (60.0, 35), (75.0, 55), (90.0, 100)]),
+            mk(&[(40.0, 45), (55.0, 50), (70.0, 60), (85.0, 80), (95.0, 100)]),
+        );
+        curves.insert(
+            "quiet-battery".to_string(),
+            mk(&[(40.0, 40), (55.0, 45), (70.0, 55), (85.0, 75), (95.0, 100)]),
         );
         curves.insert(
             "balanced".to_string(),
-            mk(&[
-                (40.0, 30),
-                (55.0, 40),
-                (65.0, 50),
-                (75.0, 65),
-                (85.0, 85),
-                (95.0, 100),
-            ]),
+            mk(&[(40.0, 50), (55.0, 55), (70.0, 60), (85.0, 85), (95.0, 100)]),
         );
         curves.insert(
             "performance".to_string(),
-            mk(&[(40.0, 40), (55.0, 55), (65.0, 70), (75.0, 85), (85.0, 100)]),
+            mk(&[(40.0, 55), (55.0, 65), (70.0, 75), (85.0, 90), (95.0, 100)]),
         );
         Self {
             curves,

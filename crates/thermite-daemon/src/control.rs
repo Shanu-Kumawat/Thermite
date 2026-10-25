@@ -807,7 +807,7 @@ mod tests {
         let t0 = Instant::now();
 
         control.tick_once(t0);
-        // FakeBackend defaults: cpu 55°C -> balanced curve duty 40%.
+        // FakeBackend defaults: cpu 55°C -> balanced curve duty 55%.
         let writes = ops(&fake, FanId::Cpu);
         assert_eq!(
             writes,
@@ -818,7 +818,7 @@ mod tests {
                 },
                 WriteOp::Duty {
                     fan: FanId::Cpu,
-                    duty_pct: 40
+                    duty_pct: 55
                 },
             ]
         );

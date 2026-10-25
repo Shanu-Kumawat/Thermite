@@ -14,6 +14,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use gpui_kit::component::chart::AreaChart;
+use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::{Icon, Theme, ThemeMode, TitleBar, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -628,6 +629,7 @@ impl ThermiteApp {
     /// One metric card: icon + title header, big current value, area chart
     /// with a fixed y-domain, grid and axis labels (mockup style). `ticks`
     /// is the number of labels (intervals = ticks - 1).
+    #[allow(clippy::too_many_arguments)]
     fn render_metric_card(
         &self,
         id: &'static str,
@@ -1369,7 +1371,15 @@ impl ThermiteApp {
         let name = fan.to_string();
         let bounds_cell: Rc<RefCell<Option<Bounds<Pixels>>>> = Rc::default();
         let pts: Vec<(f32, f32)> = points.iter().map(|p| (p.0, f32::from(p.1))).collect();
-        let operating_duty = CurveDef::from_points(points.to_vec()).duty_at(temp);
+        // The marker shows the fan's ACTUAL state (hardware duty readback),
+        // not the curve's ideal value — it visibly leaves the curve when
+        // the firmware or anything else overrides us.
+        let actual_duty = self
+            .status
+            .as_ref()
+            .and_then(|s| s.telemetry.fan(fan))
+            .and_then(|h| h.duty_pct)
+            .unwrap_or_else(|| CurveDef::from_points(points.to_vec()).duty_at(temp));
         let drag_idx = self
             .drag_point
             .as_ref()
@@ -1414,8 +1424,12 @@ impl ThermiteApp {
                 if paint_pts.is_empty() {
                     return;
                 }
-                let (ft, fd) = paint_pts[0];
-                let (lt, _ld) = *paint_pts.last().unwrap();
+                let Some((ft, fd)) = paint_pts.first().copied() else {
+                    return;
+                };
+                let Some((lt, _ld)) = paint_pts.last().copied() else {
+                    return;
+                };
                 // Area fill under the curve.
                 let mut area = PathBuilder::fill();
                 area.move_to(xy(ft, fd));
@@ -1464,7 +1478,7 @@ impl ThermiteApp {
                     ));
                 }
                 // Live operating point (white).
-                let c = xy(temp, f32::from(operating_duty));
+                let c = xy(temp, f32::from(actual_duty));
                 window.paint_quad(quad(
                     Bounds::new(point(c.x - px(3.0), c.y - px(3.0)), size(px(6.0), px(6.0))),
                     px(3.0),
@@ -1498,7 +1512,7 @@ impl ThermiteApp {
                         let px_y = f32::from(bounds.size.height)
                             * (1.0 - (f32::from(p.1) / 100.0).clamp(0.0, 1.0));
                         let dist = ((rel_x - px_x).powi(2) + (rel_y - px_y).powi(2)).sqrt();
-                        if dist <= 18.0 && best.map_or(true, |(_, d)| dist < d) {
+                        if dist <= 18.0 && best.is_none_or(|(_, d)| dist < d) {
                             best = Some((i, dist));
                         }
                     }
@@ -2093,7 +2107,8 @@ impl Render for ThermiteApp {
                         div()
                             .id("content")
                             .flex_1()
-                            .overflow_y_scroll()
+                            .min_h_0()
+                            .overflow_y_scrollbar()
                             .map(|this| match self.nav {
                                 Nav::Dashboard => this.child(self.render_dashboard(cx)),
                                 Nav::Fans => this.child(self.render_fans(cx)),
