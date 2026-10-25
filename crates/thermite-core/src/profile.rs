@@ -1,77 +1,58 @@
 //! Platform performance profiles.
 //!
-//! The ANV15-51 exposes platform profiles through
-//! `/sys/firmware/acpi/platform_profile` once the acer-wmi gaming interface is
-//! active (kernel ≥ 7.3 with the ANV15-51 quirk, the stopgap DKMS module, or
-//! `acer_wmi predator_v4=1`). Known firmware behavior on BIOS V1.60: turbo is
-//! rejected with an I/O error, so it is offered but must fail gracefully —
-//! clients treat the *available* list reported by the daemon as authoritative,
-//! not this enum.
+//! Profile names are opaque strings owned by the machine's firmware/driver
+//! (e.g. `/sys/firmware/acpi/platform_profile` choices). Config accepts any
+//! name; the daemon validates against the driver-reported available list at
+//! runtime. [`PlatformProfile::KNOWN`] lists the common Linux
+//! platform-profile names — on the Acer ANV15-51 (BIOS V1.60) turbo is
+//! rejected with an I/O error, so clients must treat the *available* list
+//! reported by the daemon as authoritative, not this list.
+
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-/// Platform profile names understood by the firmware, in
-/// quiet → loud order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum PlatformProfile {
-    /// Lowest power ("low-power" in sysfs).
-    LowPower,
-    /// Quiet bias.
-    Quiet,
-    /// Balanced (factory default).
-    #[default]
-    Balanced,
-    /// Balanced-performance (between balanced and performance).
-    BalancedPerformance,
-    /// Full performance.
-    Performance,
-    /// Turbo — rejected by ANV15-51 firmware (kept for completeness).
-    Turbo,
-}
+/// Common platform profile names, in quiet → loud order.
+pub const KNOWN_PROFILES: &[&str] = &[
+    "low-power",
+    "quiet",
+    "balanced",
+    "balanced-performance",
+    "performance",
+    "turbo",
+];
+
+/// A platform profile name as reported by the firmware/driver.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub struct PlatformProfile(Arc<str>);
 
 impl PlatformProfile {
-    /// sysfs string for this profile.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::LowPower => "low-power",
-            Self::Quiet => "quiet",
-            Self::Balanced => "balanced",
-            Self::BalancedPerformance => "balanced-performance",
-            Self::Performance => "performance",
-            Self::Turbo => "turbo",
-        }
+    /// Wrap a profile name. Any non-empty name is accepted; validation
+    /// against the machine's available list happens at runtime.
+    pub fn new(name: &str) -> Self {
+        Self(Arc::from(name))
     }
 
-    /// Parse a sysfs profile string, tolerating unknown values as `None`.
-    pub fn parse(s: &str) -> Option<Self> {
-        Some(match s.trim() {
-            "low-power" => Self::LowPower,
-            "quiet" => Self::Quiet,
-            "balanced" => Self::Balanced,
-            "balanced-performance" => Self::BalancedPerformance,
-            "performance" => Self::Performance,
-            "turbo" => Self::Turbo,
-            _ => return None,
-        })
+    /// The profile name.
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 
-    /// Every profile we know about.
-    pub fn all() -> [PlatformProfile; 6] {
-        [
-            Self::LowPower,
-            Self::Quiet,
-            Self::Balanced,
-            Self::BalancedPerformance,
-            Self::Performance,
-            Self::Turbo,
-        ]
+    /// Whether this name is one of the common Linux platform profiles.
+    pub fn is_known(&self) -> bool {
+        KNOWN_PROFILES.contains(&self.0.as_ref())
+    }
+}
+
+impl From<&str> for PlatformProfile {
+    fn from(s: &str) -> Self {
+        Self::new(s)
     }
 }
 
 impl std::fmt::Display for PlatformProfile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
+        f.write_str(&self.0)
     }
 }
 
@@ -80,23 +61,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn roundtrips_sysfs_names() {
-        for p in PlatformProfile::all() {
-            assert_eq!(PlatformProfile::parse(p.as_str()), Some(p));
-            assert_eq!(p.to_string(), p.as_str());
-        }
+    fn any_name_accepted() {
+        let p = PlatformProfile::new("custom-vendor-mode");
+        assert_eq!(p.to_string(), "custom-vendor-mode");
+        assert!(!p.is_known());
+        assert!(PlatformProfile::new("quiet").is_known());
     }
 
     #[test]
-    fn unknown_names_are_none() {
-        assert_eq!(PlatformProfile::parse("custom"), None);
-        assert_eq!(PlatformProfile::parse(""), None);
-    }
-
-    #[test]
-    fn serde_kebab_case() {
+    fn serde_plain_string() {
         assert_eq!(
-            serde_json::to_string(&PlatformProfile::BalancedPerformance).unwrap(),
+            serde_json::to_string(&PlatformProfile::new("balanced-performance")).unwrap(),
             "\"balanced-performance\""
         );
     }

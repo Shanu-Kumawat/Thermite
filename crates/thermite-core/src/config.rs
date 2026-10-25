@@ -114,18 +114,8 @@ impl Default for FanConfig {
     }
 }
 
-/// Both fans, keyed by hardware role.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
-#[serde(default, deny_unknown_fields)]
-pub struct FansConfig {
-    /// CPU fan settings.
-    pub cpu: FanConfig,
-    /// GPU fan settings.
-    pub gpu: FanConfig,
-}
-
 /// Platform (performance) profile settings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct PlatformConfig {
     /// Profile the daemon keeps applied. `None` (written as
@@ -149,9 +139,7 @@ where
     let value: Option<String> = Option::deserialize(deserializer)?;
     match value.as_deref() {
         None | Some("none") | Some("") => Ok(None),
-        Some(name) => PlatformProfile::parse(name)
-            .map(Some)
-            .ok_or_else(|| serde::de::Error::custom(format!("unknown profile \"{name}\""))),
+        Some(name) => Ok(Some(PlatformProfile::new(name))),
     }
 }
 
@@ -165,8 +153,10 @@ pub struct Config {
     pub failsafe: FailsafeThresholds,
     /// Hysteresis tuning.
     pub hysteresis: HysteresisConfig,
-    /// Per-fan control mode.
-    pub fans: FansConfig,
+    /// Per-fan control mode, keyed by the driver-reported fan name
+    /// (`[fans."cpu"]`, `[fans."gpu"]`, …). Fans present on the machine but
+    /// absent from config default to auto.
+    pub fans: BTreeMap<String, FanConfig>,
     /// Platform profile policy.
     pub platform: PlatformConfig,
     /// Named fan curves (`[curves.<name>]`).
@@ -258,7 +248,7 @@ impl Config {
             }
         }
 
-        for (fan, cfg) in [("cpu", &self.fans.cpu), ("gpu", &self.fans.gpu)] {
+        for (fan, cfg) in &self.fans {
             match cfg.mode {
                 FanModeKind::Auto => {}
                 FanModeKind::Manual => match cfg.manual_duty_pct {
@@ -380,8 +370,8 @@ points = [[50, 25], [70, 45]]
 "#;
         let cfg = Config::from_toml_str(toml_src).unwrap();
         assert_eq!(cfg.general.poll_interval_ms, 500);
-        assert_eq!(cfg.fans.gpu.manual_duty_pct, Some(55));
-        assert_eq!(cfg.platform.active, Some(PlatformProfile::Quiet));
+        assert_eq!(cfg.fans["gpu"].manual_duty_pct, Some(55));
+        assert_eq!(cfg.platform.active, Some(PlatformProfile::new("quiet")));
         cfg.validate().unwrap();
 
         let out = cfg.to_toml_string().unwrap();
@@ -472,7 +462,7 @@ points = [[45, 20]]
                 .unwrap()
                 .platform
                 .active,
-            Some(PlatformProfile::Quiet)
+            Some(PlatformProfile::new("quiet"))
         );
         // Explicit value still round-trips through TOML persistence.
         let cfg = Config::from_toml_str("[platform]\nactive = \"balanced\"\n").unwrap();

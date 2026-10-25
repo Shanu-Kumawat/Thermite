@@ -20,7 +20,7 @@ thermite-core = { path = "crates/thermite-core" }
 thermite-proto = { path = "crates/thermite-proto" }
 thermite-backend = { path = "crates/thermite-backend" }
 
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 toml = "0.9"
 thiserror = "2"

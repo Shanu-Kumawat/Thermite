@@ -1,91 +1,101 @@
 //! Sensor/control telemetry types and the hardware [`Backend`] trait.
 //!
 //! These types are shared by the daemon, the IPC protocol, the CLI and the
-//! GUI, so they carry serde derives and stable field semantics.
+//! GUI, so they carry serde derives and stable field semantics. Nothing here
+//! assumes a particular vendor, fan count, or kernel interface — drivers
+//! enumerate their fans via [`Backend::fans`] and translate abstract intents
+//! ([`HwFanMode`], duty percent) into whatever their hardware speaks.
+
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// Which physical fan a setting or reading refers to.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord, Default,
-)]
-#[serde(rename_all = "lowercase")]
-pub enum FanId {
-    /// CPU fan (fan1 on the acer-wmi hwmon).
-    #[default]
-    Cpu,
-    /// GPU fan (fan2 on the acer-wmi hwmon).
-    Gpu,
-}
+/// Identifies a fan by driver-reported name (e.g. `"cpu"`, `"gpu"`, `"intake"`).
+///
+/// Names come from the active driver's [`FanDescriptor`]s, are used as config
+/// keys (`[fans."cpu"]`), IPC identifiers, and display keys. Cheap to clone.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, Default)]
+pub struct FanId(Arc<str>);
 
 impl FanId {
-    /// Both fans in fixed order.
-    pub fn all() -> [FanId; 2] {
-        [FanId::Cpu, FanId::Gpu]
+    /// Create a fan id from a name.
+    pub fn new(name: &str) -> Self {
+        Self(Arc::from(name))
     }
 
-    /// Lowercase name used in config keys and IPC.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Cpu => "cpu",
-            Self::Gpu => "gpu",
-        }
+    /// The fan name.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&str> for FanId {
+    fn from(s: &str) -> Self {
+        Self::new(s)
+    }
+}
+
+impl From<String> for FanId {
+    fn from(s: String) -> Self {
+        Self(Arc::from(s.as_str()))
     }
 }
 
 impl std::fmt::Display for FanId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
+        f.write_str(&self.0)
     }
 }
 
-/// Hardware fan mode as expressed by the acer-wmi `pwmX_enable` values.
-///
-/// NOTE: the ANV15-51 driver convention is *inverted* relative to the usual
-/// hwmon convention — `0` = turbo (full), `1` = custom/manual, `2` = auto.
+/// Which temperature input drives a fan, as declared by the driver.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", tag = "kind", content = "name")]
+pub enum TempSource {
+    /// Peak CPU-class temperature (coretemp etc., board zones as fallback).
+    Cpu,
+    /// Peak GPU temperature (NVML preferred, then GPU-class sensors).
+    Gpu,
+    /// A specific named sensor; the driver resolves the label at runtime.
+    Named(String),
+}
+
+/// A fan reported by the active driver.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FanDescriptor {
+    /// Stable fan name (config key / IPC id).
+    pub id: FanId,
+    /// Human-readable label for UI, e.g. `"CPU Fan"`.
+    pub label: String,
+    /// Which temperature input drives this fan.
+    pub temp_source: TempSource,
+}
+
+/// Abstract fan-control intent. Drivers translate this into their hardware's
+/// convention — e.g. the acer-wmi `pwmX_enable` mapping is *inverted* relative
+/// to the usual hwmon convention (`0` = turbo, `1` = custom, `2` = auto); that
+/// translation lives in the acer driver, not here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum HwFanMode {
-    /// `pwmX_enable = 0` — maximum speed.
+    /// Maximum cooling.
     Turbo,
-    /// `pwmX_enable = 1` — duty from `pwmX`.
+    /// Duty from the last `set_fan_duty` write.
     Custom,
-    /// `pwmX_enable = 2` — firmware auto control.
+    /// Firmware automatic control.
     Auto,
 }
 
-impl HwFanMode {
-    /// sysfs value for `pwmX_enable` (acer-wmi convention).
-    pub fn enable_value(self) -> u8 {
-        match self {
-            Self::Turbo => 0,
-            Self::Custom => 1,
-            Self::Auto => 2,
-        }
-    }
-
-    /// Parse a `pwmX_enable` readback; unknown values map to `None`.
-    pub fn from_enable_value(v: u8) -> Option<Self> {
-        Some(match v {
-            0 => Self::Turbo,
-            1 => Self::Custom,
-            2 => Self::Auto,
-            _ => return None,
-        })
-    }
-}
-
 /// One fan's current hardware state.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct FanTelemetry {
     /// Which fan.
     pub id: FanId,
     /// RPM if reported.
     pub rpm: Option<u32>,
-    /// Commanded duty percent readback (`pwmX`) if present.
+    /// Commanded duty percent readback if present.
     pub duty_pct: Option<u8>,
-    /// `pwmX_enable` readback.
+    /// Hardware mode readback, when the driver can express it.
     pub hw_mode: Option<HwFanMode>,
 }
 
@@ -94,9 +104,9 @@ pub struct FanTelemetry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum TempClass {
-    /// CPU package/cores (drives the CPU fan).
+    /// CPU package/cores.
     Cpu,
-    /// GPU (drives the GPU fan).
+    /// GPU.
     Gpu,
     /// NVMe SSD.
     Nvme,
@@ -151,62 +161,65 @@ pub struct Telemetry {
 
 impl Telemetry {
     /// Peak CPU temperature across CPU-class sensors (falls back to board
-    /// zones). This is what drives the CPU fan and CPU failsafes.
+    /// zones).
     pub fn cpu_temp_c(&self) -> Option<f32> {
-        let cpu = self
-            .temps
-            .iter()
-            .filter(|t| t.class == TempClass::Cpu)
-            .map(|t| t.temp_c)
-            .fold(None, |acc: Option<f32>, t| {
-                Some(acc.map_or(t, |a| a.max(t)))
-            });
-        cpu.or_else(|| self.board_max())
+        self.temp_by_class(TempClass::Cpu).or_else(|| self.board_max())
     }
 
-    /// Peak GPU temperature (NVML preferred, then GPU-class sensors).
+    /// Peak GPU temperature (NVML preferred, then GPU-class sensors, then
+    /// board zones).
     pub fn gpu_temp_c(&self) -> Option<f32> {
-        if let Some(g) = &self.gpu {
-            return Some(g.temp_c);
-        }
-        self.temps
-            .iter()
-            .filter(|t| t.class == TempClass::Gpu)
-            .map(|t| t.temp_c)
-            .fold(None, |acc: Option<f32>, t| {
-                Some(acc.map_or(t, |a| a.max(t)))
-            })
+        self.gpu
+            .as_ref()
+            .map(|g| g.temp_c)
+            .or_else(|| self.temp_by_class(TempClass::Gpu))
             .or_else(|| self.board_max())
     }
 
-    fn board_max(&self) -> Option<f32> {
+    /// Peak temperature across sensors of one class.
+    pub fn temp_by_class(&self, class: TempClass) -> Option<f32> {
         self.temps
             .iter()
-            .filter(|t| t.class == TempClass::Board)
+            .filter(|t| t.class == class)
             .map(|t| t.temp_c)
-            .fold(None, |acc: Option<f32>, t| {
-                Some(acc.map_or(t, |a| a.max(t)))
-            })
+            .fold(None, |acc: Option<f32>, t| Some(acc.map_or(t, |a| a.max(t))))
+    }
+
+    /// Resolve a fan's driving temperature per its declared [`TempSource`].
+    pub fn temp_for(&self, source: &TempSource) -> Option<f32> {
+        match source {
+            TempSource::Cpu => self.cpu_temp_c(),
+            TempSource::Gpu => self.gpu_temp_c(),
+            TempSource::Named(label) => self
+                .temps
+                .iter()
+                .find(|t| &t.label == label)
+                .map(|t| t.temp_c),
+        }
+    }
+
+    fn board_max(&self) -> Option<f32> {
+        self.temp_by_class(TempClass::Board)
     }
 
     /// Telemetry for one fan.
-    pub fn fan(&self, id: FanId) -> Option<&FanTelemetry> {
-        self.fans.iter().find(|f| f.id == id)
+    pub fn fan(&self, id: &FanId) -> Option<&FanTelemetry> {
+        self.fans.iter().find(|f| &f.id == id)
     }
 }
 
-/// How much the acer-wmi gaming interface currently offers.
+/// How much the active driver currently offers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum CapabilityLevel {
-    /// No fan/profile interface at all (telemetry still available from
+    /// No fan/profile interface at all (telemetry may still be available from
     /// generic hwmon sensors).
     #[default]
     None,
     /// Fan RPM/temps readable and platform profiles settable, but no manual
-    /// pwm (`acer_wmi predator_v4=1` without the ANV15-51 quirk).
+    /// fan control.
     MonitorProfiles,
-    /// Full control: telemetry + `pwmX`/`pwmX_enable` manual fan control.
+    /// Full control: telemetry + manual fan duty/mode control.
     Full,
 }
 
@@ -216,8 +229,10 @@ pub enum CapabilityLevel {
 pub struct CapabilityReport {
     /// Coarse capability level.
     pub level: CapabilityLevel,
-    /// Path of the acer-wmi hwmon directory when found.
-    pub acer_wmi_hwmon: Option<String>,
+    /// Name of the active fan/thermal driver, when one matched.
+    pub driver: Option<String>,
+    /// Driver-specific detail line (e.g. the matched hwmon path).
+    pub driver_detail: Option<String>,
     /// Platform profile choices exposed by the firmware.
     pub platform_profiles: Vec<String>,
     /// Human-readable findings (also shown by `doctor`).
@@ -241,19 +256,26 @@ pub enum BackendError {
     Invalid(String),
 }
 
-/// Hardware access abstraction implemented by `thermite-backend`
-/// (sysfs/NVML) and by fakes in tests.
+/// Hardware access abstraction implemented by `thermite-backend` drivers
+/// (sysfs/NVML/…) and by fakes in tests.
+///
+/// A driver is anything that can enumerate fans and read temperatures; control
+/// methods may return `BackendError::Unsupported` when the hardware doesn't
+/// allow them. The trait assumes nothing about *how* a driver talks to
+/// hardware (hwmon sysfs, WMI, EC, …).
 pub trait Backend: Send {
+    /// Fans this driver controls/reports, in stable order.
+    fn fans(&self) -> &[FanDescriptor];
     /// Probe current capabilities (cheap; cacheable by callers).
     fn capability(&self) -> CapabilityReport;
     /// Read a full telemetry snapshot.
     fn read_telemetry(&mut self) -> Result<Telemetry, BackendError>;
     /// Set a fan's hardware mode (auto/custom/turbo).
-    fn set_fan_hw_mode(&mut self, fan: FanId, mode: HwFanMode) -> Result<(), BackendError>;
+    fn set_fan_hw_mode(&mut self, fan: &FanId, mode: HwFanMode) -> Result<(), BackendError>;
     /// Set fan duty percent (implies custom mode; caller sets mode too).
-    fn set_fan_duty(&mut self, fan: FanId, duty_pct: u8) -> Result<(), BackendError>;
-    /// Apply a platform profile by sysfs name; errors reflect firmware
-    /// rejection (e.g. turbo → EIO on this model).
+    fn set_fan_duty(&mut self, fan: &FanId, duty_pct: u8) -> Result<(), BackendError>;
+    /// Apply a platform profile by driver-reported name; errors reflect
+    /// firmware rejection.
     fn set_platform_profile(&mut self, profile: &str) -> Result<(), BackendError>;
 }
 
@@ -262,19 +284,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hw_mode_enable_mapping() {
-        assert_eq!(HwFanMode::Turbo.enable_value(), 0);
-        assert_eq!(HwFanMode::Custom.enable_value(), 1);
-        assert_eq!(HwFanMode::Auto.enable_value(), 2);
-        assert_eq!(HwFanMode::from_enable_value(1), Some(HwFanMode::Custom));
-        assert_eq!(HwFanMode::from_enable_value(7), None);
+    fn fan_id_display_and_serde() {
+        let id = FanId::new("intake");
+        assert_eq!(id.to_string(), "intake");
+        assert_eq!(serde_json::to_string(&FanId::new("cpu")).unwrap(), "\"cpu\"");
+        assert_eq!(
+            serde_json::from_str::<FanId>("\"gpu\"").unwrap(),
+            FanId::new("gpu")
+        );
     }
 
     #[test]
     fn telemetry_temperature_selection() {
         let t = Telemetry {
             fans: vec![FanTelemetry {
-                id: FanId::Cpu,
+                id: FanId::new("cpu"),
                 rpm: Some(2400),
                 duty_pct: Some(45),
                 hw_mode: Some(HwFanMode::Custom),
@@ -312,8 +336,15 @@ mod tests {
         };
         assert_eq!(t.cpu_temp_c(), Some(62.0));
         assert_eq!(t.gpu_temp_c(), Some(47.0)); // NVML preferred
-        assert_eq!(t.fan(FanId::Cpu).and_then(|f| f.rpm), Some(2400));
-        assert_eq!(t.fan(FanId::Gpu), None);
+        assert_eq!(
+            t.temp_for(&TempSource::Named("Composite".into())),
+            Some(67.0)
+        );
+        assert_eq!(
+            t.fan(&FanId::new("cpu")).and_then(|f| f.rpm),
+            Some(2400)
+        );
+        assert!(t.fan(&FanId::new("gpu")).is_none());
     }
 
     #[test]
@@ -328,5 +359,6 @@ mod tests {
         };
         assert_eq!(t.cpu_temp_c(), Some(54.0));
         assert_eq!(t.gpu_temp_c(), Some(54.0));
+        assert_eq!(t.temp_for(&TempSource::Cpu), Some(54.0));
     }
 }
