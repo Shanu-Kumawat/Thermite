@@ -952,9 +952,10 @@ impl ThermiteApp {
         let curve_mode = mode == FanModeKind::Curve;
 
         // Content row: left control column, plus mode-specific right side.
+        let left_share = if curve_mode { 0.5 } else { 0.4 };
         let mut content = h_flex().gap_4().items_stretch().child(
             v_flex()
-                .w(relative(0.4))
+                .w(relative(left_share))
                 .flex_none()
                 .min_w_0()
                 .gap_3()
@@ -1356,8 +1357,9 @@ impl ThermiteApp {
         Some((frac * 100.0).round() as u8)
     }
 
-    /// Interactive temperature-to-duty curve editor: painted curve with
-    /// draggable points, live operating-point marker, axis labels.
+    /// Interactive temperature-to-duty curve editor. Grid, fill, line,
+    /// dots and the live operating marker are all painted in one canvas
+    /// from the same points; the overlay div only handles drag events.
     fn render_curve_graph(
         &self,
         fan: FanId,
@@ -1367,8 +1369,13 @@ impl ThermiteApp {
     ) -> Div {
         let name = fan.to_string();
         let bounds_cell: Rc<RefCell<Option<Bounds<Pixels>>>> = Rc::default();
-        let pts: Vec<CurvePoint> = points.to_vec();
+        let pts: Vec<(f32, f32)> = points.iter().map(|p| (p.0, f32::from(p.1))).collect();
         let operating_duty = CurveDef::from_points(points.to_vec()).duty_at(temp);
+        let drag_idx = self
+            .drag_point
+            .as_ref()
+            .filter(|(f, _)| f == &name)
+            .map(|(_, i)| *i);
 
         let paint_pts = pts.clone();
         let graph = canvas(
@@ -1379,6 +1386,17 @@ impl ThermiteApp {
                 }
             },
             move |bounds: Bounds<Pixels>, _: (), window: &mut Window, _: &mut App| {
+                let h = f32::from(bounds.size.height);
+                let w = f32::from(bounds.size.width);
+                if h <= 0.0 || w <= 0.0 {
+                    return;
+                }
+                let xy = move |t: f32, d: f32| {
+                    point(
+                        bounds.origin.x + bounds.size.width * (t / 100.0).clamp(0.0, 1.0),
+                        bounds.origin.y + bounds.size.height * (1.0 - (d / 100.0).clamp(0.0, 1.0)),
+                    )
+                };
                 // Grid: 5 horizontal (duty steps), 6 vertical (temp steps).
                 for i in 0..=4 {
                     let y = bounds.origin.y + bounds.size.height * (i as f32 / 4.0);
@@ -1397,52 +1415,69 @@ impl ThermiteApp {
                 if paint_pts.is_empty() {
                     return;
                 }
-                let xy = |p: &CurvePoint| {
-                    point(
-                        bounds.origin.x + bounds.size.width * (p.0 / 100.0).min(1.0),
-                        bounds.origin.y + bounds.size.height * (1.0 - f32::from(p.1) / 100.0),
-                    )
-                };
+                let (ft, fd) = paint_pts[0];
+                let (lt, _ld) = *paint_pts.last().unwrap();
                 // Area fill under the curve.
                 let mut area = PathBuilder::fill();
-                area.move_to(xy(&paint_pts[0]));
-                for p in paint_pts.iter().skip(1) {
-                    area.line_to(xy(p));
+                area.move_to(xy(ft, fd));
+                for (t, d) in paint_pts.iter().skip(1) {
+                    area.line_to(xy(*t, *d));
                 }
-                let last = xy(paint_pts.last().unwrap());
-                let first = xy(&paint_pts[0]);
-                area.line_to(point(last.x, bounds.origin.y + bounds.size.height));
-                area.line_to(point(first.x, bounds.origin.y + bounds.size.height));
+                area.line_to(xy(lt, 0.0));
+                area.line_to(xy(ft, 0.0));
                 if let Ok(path) = area.build() {
-                    window.paint_path(path, ACCENT.opacity(0.12));
+                    window.paint_path(path, ACCENT.opacity(0.15));
                 }
                 // Curve line.
                 let mut line = PathBuilder::stroke(px(2.));
-                line.move_to(first);
-                for p in paint_pts.iter().skip(1) {
-                    line.line_to(xy(p));
+                line.move_to(xy(ft, fd));
+                for (t, d) in paint_pts.iter().skip(1) {
+                    line.line_to(xy(*t, *d));
                 }
                 if let Ok(path) = line.build() {
                     window.paint_path(path, ACCENT);
                 }
+                // Points: dark halo + red core (bigger while dragged).
+                for (i, (t, d)) in paint_pts.iter().enumerate() {
+                    let c = xy(*t, *d);
+                    let r = if drag_idx == Some(i) { 7.0 } else { 5.0 };
+                    window.paint_quad(quad(
+                        Bounds::new(
+                            point(c.x - px(r + 2.0), c.y - px(r + 2.0)),
+                            size(px((r + 2.0) * 2.0), px((r + 2.0) * 2.0)),
+                        ),
+                        px(r + 2.0),
+                        BG,
+                        px(0.),
+                        BG,
+                        BorderStyle::default(),
+                    ));
+                    window.paint_quad(quad(
+                        Bounds::new(
+                            point(c.x - px(r), c.y - px(r)),
+                            size(px(r * 2.0), px(r * 2.0)),
+                        ),
+                        px(r),
+                        ACCENT,
+                        px(0.),
+                        BG,
+                        BorderStyle::default(),
+                    ));
+                }
+                // Live operating point (white).
+                let c = xy(temp, f32::from(operating_duty));
+                window.paint_quad(quad(
+                    Bounds::new(point(c.x - px(3.0), c.y - px(3.0)), size(px(6.0), px(6.0))),
+                    px(3.0),
+                    TEXT,
+                    px(0.),
+                    BG,
+                    BorderStyle::default(),
+                ));
             },
         )
         .absolute()
         .inset_0();
-
-        let curve_dot = |frac_x: f32, frac_y: f32, color: Hsla, diameter: f32| {
-            div()
-                .absolute()
-                .size(px(diameter))
-                .rounded_full()
-                .bg(color)
-                .border_2()
-                .border_color(BG)
-                .left(relative(frac_x.clamp(0.0, 1.0)))
-                .top(relative(frac_y.clamp(0.0, 1.0)))
-                .ml(px(-diameter / 2.0))
-                .mt(px(-diameter / 2.0))
-        };
 
         let overlay = div()
             .absolute()
@@ -1460,10 +1495,11 @@ impl ThermiteApp {
                     let rel_y = f32::from(ev.position.y - bounds.origin.y);
                     let mut best: Option<(usize, f32)> = None;
                     for (i, p) in pts.iter().enumerate() {
-                        let px_x = f32::from(bounds.size.width) * (p.0 / 100.0).min(1.0);
-                        let px_y = f32::from(bounds.size.height) * (1.0 - f32::from(p.1) / 100.0);
+                        let px_x = f32::from(bounds.size.width) * (p.0 / 100.0).clamp(0.0, 1.0);
+                        let px_y = f32::from(bounds.size.height)
+                            * (1.0 - (f32::from(p.1) / 100.0).clamp(0.0, 1.0));
                         let dist = ((rel_x - px_x).powi(2) + (rel_y - px_y).powi(2)).sqrt();
-                        if dist <= 16.0 && best.map_or(true, |(_, d)| dist < d) {
+                        if dist <= 18.0 && best.map_or(true, |(_, d)| dist < d) {
                             best = Some((i, dist));
                         }
                     }
@@ -1537,7 +1573,6 @@ impl ThermiteApp {
 
         v_flex()
             .flex_1()
-            .min_h(px(240.))
             .gap_2()
             .child(
                 h_flex()
@@ -1555,8 +1590,7 @@ impl ThermiteApp {
             .child(
                 h_flex()
                     .gap_2()
-                    .flex_1()
-                    .min_h_0()
+                    .h(px(240.))
                     .child(v_flex().justify_between().h_full().w(px(24.)).children(
                         [100, 75, 50, 25, 0].map(|v| {
                             div()
@@ -1570,27 +1604,8 @@ impl ThermiteApp {
                         div()
                             .relative()
                             .flex_1()
-                            .min_h_0()
+                            .h_full()
                             .child(graph)
-                            .children(pts.iter().enumerate().map(|(i, p)| {
-                                let dragged = self
-                                    .drag_point
-                                    .as_ref()
-                                    .is_some_and(|(f, di)| f == &name && *di == i);
-                                curve_dot(
-                                    p.0 / 100.0,
-                                    1.0 - f32::from(p.1) / 100.0,
-                                    ACCENT,
-                                    if dragged { 14.0 } else { 10.0 },
-                                )
-                            }))
-                            // live operating point (white marker)
-                            .child(curve_dot(
-                                temp / 100.0,
-                                1.0 - f32::from(operating_duty) / 100.0,
-                                TEXT,
-                                6.0,
-                            ))
                             .child(overlay),
                     ),
             )
@@ -1614,15 +1629,16 @@ impl ThermiteApp {
             )
     }
 
-    /// Curve-mode right panel: preset curves + the selected curve's points.
+    /// Curve-mode right panel: presets, and the point list with full
+    /// editing (temp/duty steppers, remove, add).
     fn render_curve_panel(&self, fan: FanId, points: &[CurvePoint], cx: &Context<Self>) -> Div {
         let name = fan.to_string();
         let active_curve = self.fan_curve_name(fan);
         let curves: Vec<String> = self.config.curves.keys().cloned().collect();
 
         v_flex()
-            .w(px(330.))
-            .flex_none()
+            .flex_1()
+            .min_w_0()
             .gap_3()
             .child(
                 div()
@@ -1678,40 +1694,64 @@ impl ThermiteApp {
                     .text_xs()
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(TEXT_MUTED)
-                    .child("Curve points"),
+                    .child("Curve points — drag dots on the graph or edit here"),
             )
             .child(
                 v_flex()
+                    .id(SharedString::new(format!("points-{name}")))
                     .gap_1()
-                    .max_h(px(170.))
+                    .max_h(px(190.))
                     .overflow_y_scrollbar()
                     .children(points.iter().enumerate().map(|(i, p)| {
-                        let is_dragging = self
-                            .drag_point
-                            .as_ref()
-                            .is_some_and(|(f, di)| f == &name && *di == i);
                         h_flex()
-                            .gap_3()
+                            .gap_2()
                             .items_center()
                             .px_3()
                             .py_1p5()
                             .rounded_md()
-                            .when(is_dragging, |this| this.bg(SURFACE_RAISED))
+                            .bg(BG)
                             .child(div().size(px(8.)).rounded_full().bg(ACCENT))
+                            // temperature stepper
                             .child(
                                 div()
-                                    .w(px(64.))
+                                    .w(px(56.))
                                     .text_sm()
                                     .text_color(TEXT)
                                     .child(format!("{:.0}°C", p.0)),
                             )
+                            .child(self.stepper(format!("pt-t-{name}-{i}"), "−", {
+                                let points = points.to_vec();
+                                cx.listener(move |this, _ev: &ClickEvent, _window, _cx| {
+                                    this.adjust_point(fan, i, &points, -5.0, 0);
+                                })
+                            }))
+                            .child(self.stepper(format!("pt-t+{name}-{i}"), "+", {
+                                let points = points.to_vec();
+                                cx.listener(move |this, _ev: &ClickEvent, _window, _cx| {
+                                    this.adjust_point(fan, i, &points, 5.0, 0);
+                                })
+                            }))
+                            // duty stepper
                             .child(
                                 div()
-                                    .flex_1()
+                                    .w(px(48.))
                                     .text_sm()
                                     .text_color(TEXT_MUTED)
                                     .child(format!("{}%", p.1)),
                             )
+                            .child(self.stepper(format!("pt-d-{name}-{i}"), "−", {
+                                let points = points.to_vec();
+                                cx.listener(move |this, _ev: &ClickEvent, _window, _cx| {
+                                    this.adjust_point(fan, i, &points, 0.0, -5);
+                                })
+                            }))
+                            .child(self.stepper(format!("pt-d+{name}-{i}"), "+", {
+                                let points = points.to_vec();
+                                cx.listener(move |this, _ev: &ClickEvent, _window, _cx| {
+                                    this.adjust_point(fan, i, &points, 0.0, 5);
+                                })
+                            }))
+                            .child(div().flex_1())
                             .when(points.len() > 1, |this| {
                                 this.child(
                                     div()
@@ -1767,6 +1807,43 @@ impl ThermiteApp {
                     }))
                     .child("+ Add point"),
             )
+    }
+
+    /// A small −/+ stepper button for the point list.
+    fn stepper(
+        &self,
+        id: String,
+        label: &str,
+        on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> Stateful<Div> {
+        div()
+            .id(SharedString::from(id))
+            .size(px(20.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_sm()
+            .text_xs()
+            .text_color(TEXT_MUTED)
+            .hover(|this| this.bg(SURFACE_RAISED).text_color(TEXT))
+            .on_click(on_click)
+            .child(label.to_string())
+    }
+
+    /// Adjust one curve point (list steppers) and commit if still valid.
+    fn adjust_point(&mut self, fan: FanId, idx: usize, points: &[CurvePoint], dt: f32, dd: i16) {
+        let mut pts = points.to_vec();
+        let lo = if idx > 0 { pts[idx - 1].0 + 1.0 } else { 0.0 };
+        let hi = pts.get(idx + 1).map_or(100.0, |p| p.0 - 1.0);
+        if lo > hi {
+            return;
+        }
+        let Some(p) = pts.get_mut(idx) else {
+            return;
+        };
+        p.0 = (p.0 + dt).clamp(lo, hi);
+        p.1 = (i16::from(p.1) + dd).clamp(0, 100) as u8;
+        self.commit_curve(fan, pts);
     }
 
     fn render_fans(&self, cx: &Context<Self>) -> impl IntoElement {
