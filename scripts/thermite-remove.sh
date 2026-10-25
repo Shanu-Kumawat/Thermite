@@ -55,6 +55,8 @@ rm -f /usr/bin/thermite-daemon /usr/bin/thermite /usr/bin/thermite-gui
 rm -f /usr/lib/systemd/system/thermite.service
 rm -f /usr/lib/sysusers.d/thermite.conf
 rm -f /usr/lib/tmpfiles.d/thermite.conf
+rm -f /usr/share/applications/thermite-gui.desktop
+rm -f /usr/share/icons/hicolor/scalable/apps/thermite.svg
 systemctl daemon-reload
 info "removed binaries and service (config kept at /etc/thermite if present)"
 

@@ -121,6 +121,9 @@ install -Dm755 "$REPO_ROOT/target/release/thermite-gui"    /usr/bin/thermite-gui
 install -Dm644 "$REPO_ROOT/packaging/thermite.service" /usr/lib/systemd/system/thermite.service
 install -Dm644 "$REPO_ROOT/packaging/sysusers.conf"    /usr/lib/sysusers.d/thermite.conf
 install -Dm644 "$REPO_ROOT/packaging/tmpfiles.conf"    /usr/lib/tmpfiles.d/thermite.conf
+# Desktop launcher (app grid / wofi / rofi entry for the GUI)
+install -Dm644 "$REPO_ROOT/packaging/thermite-gui.desktop" /usr/share/applications/thermite-gui.desktop
+install -Dm644 "$REPO_ROOT/packaging/thermite.svg" /usr/share/icons/hicolor/scalable/apps/thermite.svg
 systemd-sysusers /usr/lib/sysusers.d/thermite.conf
 systemd-tmpfiles --create /usr/lib/tmpfiles.d/thermite.conf
 info "binaries, service, users and runtime dirs installed"

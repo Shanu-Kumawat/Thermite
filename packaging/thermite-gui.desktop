@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Thermite
+GenericName=Fan & Thermal Control
+Comment=Fan curves, thermal monitoring and profiles for your laptop
+Exec=thermite-gui
+Icon=thermite
+Terminal=false
+Categories=System;Monitor;
+Keywords=fan;thermal;temperature;cooling;laptop;
+StartupWMClass=thermite-gui
