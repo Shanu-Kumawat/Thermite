@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::mpsc::{self, Sender};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui_kit::component::chart::AreaChart;
 use gpui_kit::component::scroll::ScrollableElement;
@@ -38,7 +38,6 @@ mod icons {
     pub const THERMOMETER: &str = include_str!("../assets/icons/thermometer.svg");
     pub const LIST_FILTER: &str = include_str!("../assets/icons/list-filter.svg");
     pub const FLAME: &str = include_str!("../assets/icons/flame.svg");
-    pub const GAUGE: &str = include_str!("../assets/icons/gauge.svg");
     pub const SETTINGS: &str = include_str!("../assets/icons/settings.svg");
     pub const INFO: &str = include_str!("../assets/icons/info.svg");
     pub const MONITOR: &str = include_str!("../assets/icons/monitor.svg");
@@ -78,6 +77,8 @@ impl MachineInfo {
 
 /// Samples kept for charts (at 1 Hz ≈ 4 minutes).
 const MAX_SAMPLES: usize = 240;
+/// Minimum gap between live slider duty pushes while dragging.
+const THROTTLE: Duration = Duration::from_millis(100);
 
 /// Monochrome design tokens: deep black background, charcoal surfaces,
 /// subtle gray borders, white typography, restrained red accent.
@@ -199,6 +200,8 @@ pub struct ThermiteApp {
     drag_point: Option<(String, usize)>,
     /// Fan whose duty slider is being dragged.
     slider_drag: Option<String>,
+    /// Last instant a slider drag sent SetFanConfig (throttled).
+    last_slider_send: Option<(String, Instant)>,
 }
 
 impl ThermiteApp {
@@ -245,6 +248,7 @@ impl ThermiteApp {
             manual_draft: BTreeMap::new(),
             drag_point: None,
             slider_drag: None,
+            last_slider_send: None,
         }
     }
 
@@ -640,7 +644,12 @@ impl ThermiteApp {
         ticks: usize,
         _cx: &Context<Self>,
     ) -> impl IntoElement {
-        let owned: Vec<Sample> = data.to_vec();
+        let mut owned: Vec<Sample> = data.to_vec();
+        // Labels are window-relative: the oldest sample reads 0s.
+        let t0 = owned.first().map(|d| d.t).unwrap_or(0.0);
+        for d in &mut owned {
+            d.t -= t0;
+        }
         let last = owned.last().map(&value_fn).unwrap_or(0.0);
         let domain = y_domain;
         let intervals = (ticks.max(2) - 1) as f64;
@@ -940,24 +949,13 @@ impl ThermiteApp {
         };
 
         let curve_points = self.fan_points(fan);
-        let curve_duty_now = CurveDef::from_points(curve_points.clone()).duty_at(temp);
-        let failsafe = self
-            .status
-            .as_ref()
-            .map(|s| s.control.failsafe_phase)
-            .unwrap_or_default();
-        let (failsafe_label, failsafe_color) = match failsafe {
-            FailsafePhase::Normal => ("Normal".to_string(), OK),
-            FailsafePhase::ForceFull => ("Force full".to_string(), ACCENT),
-            FailsafePhase::ReleasedAuto => ("Released to firmware".to_string(), ACCENT),
-        };
-
         let curve_mode = mode == FanModeKind::Curve;
 
         // Content row: left control column, plus mode-specific right side.
         let mut content = h_flex().gap_4().items_stretch().child(
             v_flex()
-                .flex_1()
+                .w(relative(0.4))
+                .flex_none()
                 .min_w_0()
                 .gap_3()
                 .child(self.render_mode_buttons(fan, mode, cx))
@@ -970,23 +968,19 @@ impl ThermiteApp {
 
         if curve_mode {
             content = content.child(self.render_curve_panel(fan, &curve_points, cx));
-            content = content.child(self.render_fan_stats(
-                fan,
-                temp,
-                Some(curve_duty_now),
-                "Curve duty",
-                &failsafe_label,
-                failsafe_color,
-                true,
-            ));
         } else {
-            // Both fan-speed charts carry the red accent.
-            let (value_color, line_color) = (ACCENT, ACCENT.opacity(0.9));
+            // Final color rule: a speed chart turns red while its fan is
+            // spinning above 4000 rpm, white at or below — both fans alike.
+            let (value_color, line_color) = if hw_rpm.is_some_and(|r| r > 4000) {
+                (ACCENT, ACCENT.opacity(0.9))
+            } else {
+                (TEXT, TEXT.opacity(0.8))
+            };
             let chart_id = match fan {
                 FanId::Cpu => "rpm-chart-cpu",
                 FanId::Gpu => "rpm-chart-gpu",
             };
-            content = content.child(div().w(px(380.)).flex_none().child(self.render_metric_card(
+            content = content.child(div().flex_1().min_w_0().child(self.render_metric_card(
                 chart_id,
                 &format!(
                     "Fan speed ({})",
@@ -1006,23 +1000,6 @@ impl ThermiteApp {
                 5,
                 cx,
             )));
-            let (duty_label, duty_value) = match mode {
-                FanModeKind::Manual => ("Duty", format!("{}%", self.fan_duty(fan))),
-                _ => (
-                    "Fan rpm",
-                    hw_rpm.map(|r| r.to_string()).unwrap_or_else(|| "—".into()),
-                ),
-            };
-            content = content.child(self.render_fan_stats(
-                fan,
-                temp,
-                None,
-                duty_label,
-                &failsafe_label,
-                failsafe_color,
-                false,
-            ));
-            let _ = duty_value;
         }
 
         v_flex()
@@ -1069,7 +1046,7 @@ impl ThermiteApp {
                             .gap_0p5()
                             .child(
                                 h_flex()
-                                    .items_baseline()
+                                    .items_center()
                                     .gap_1()
                                     .child(
                                         div()
@@ -1082,7 +1059,25 @@ impl ThermiteApp {
                                                     .unwrap_or_else(|| "—".into()),
                                             ),
                                     )
-                                    .child(div().text_sm().text_color(TEXT_MUTED).child("rpm")),
+                                    .child(div().text_sm().text_color(TEXT_MUTED).child("rpm"))
+                                    .child(div().w(px(12.)))
+                                    .child(
+                                        h_flex()
+                                            .gap_1()
+                                            .items_center()
+                                            .child(svg_icon(icons::THERMOMETER, TEXT_MUTED, 13.))
+                                            .child(
+                                                div()
+                                                    .text_base()
+                                                    .font_weight(FontWeight::MEDIUM)
+                                                    .text_color(if temp > 45.0 {
+                                                        ACCENT
+                                                    } else {
+                                                        TEXT
+                                                    })
+                                                    .child(format!("{temp:.0}°C")),
+                                            ),
+                                    ),
                             )
                             .child(
                                 div()
@@ -1157,6 +1152,7 @@ impl ThermiteApp {
     /// Explanatory box shown in Auto mode.
     fn render_auto_info(&self) -> Div {
         div()
+            .flex_1()
             .rounded_md()
             .bg(BG)
             .border_1()
@@ -1164,13 +1160,19 @@ impl ThermiteApp {
             .p_4()
             .child(
                 h_flex()
+                    .min_w_0()
                     .gap_2()
                     .items_start()
                     .child(svg_icon(icons::INFO, TEXT_MUTED, 14.))
                     .child(
-                        div().text_sm().text_color(TEXT_MUTED).child(
-                            "In auto mode, fan speed is controlled by the embedded controller based on temperature and power limits.",
-                        ),
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_sm()
+                            .text_color(TEXT_MUTED)
+                            .child(
+                                "In auto mode, fan speed is controlled by the embedded                                  controller based on temperature and power limits.",
+                            ),
                     ),
             )
     }
@@ -1265,6 +1267,14 @@ impl ThermiteApp {
                             {
                                 this.slider_drag = Some(name.clone());
                                 this.manual_draft.insert(name.clone(), duty);
+                                let due = this
+                                    .last_slider_send
+                                    .as_ref()
+                                    .is_none_or(|(f, t)| f != &name || t.elapsed() >= THROTTLE);
+                                if due {
+                                    this.last_slider_send = Some((name.clone(), Instant::now()));
+                                    this.send_slider_duty(fan);
+                                }
                                 cx.notify();
                             }
                         })
@@ -1282,6 +1292,14 @@ impl ThermiteApp {
                                 this.slider_duty_at(&name, *bounds_cell.borrow(), ev.position.x)
                             {
                                 this.manual_draft.insert(name.clone(), duty);
+                                let due = this
+                                    .last_slider_send
+                                    .as_ref()
+                                    .is_none_or(|(f, t)| f != &name || t.elapsed() >= THROTTLE);
+                                if due {
+                                    this.last_slider_send = Some((name.clone(), Instant::now()));
+                                    this.send_slider_duty(fan);
+                                }
                                 cx.notify();
                             }
                         })
@@ -1293,16 +1311,9 @@ impl ThermiteApp {
                                 return;
                             }
                             this.slider_drag = None;
-                            let duty = this.fan_duty(fan);
+                            this.last_slider_send = None;
+                            this.send_slider_duty(fan);
                             this.manual_draft.remove(&fan.to_string());
-                            this.send(GuiCommand::SetFan {
-                                fan,
-                                config: FanConfig {
-                                    mode: FanModeKind::Manual,
-                                    curve: None,
-                                    manual_duty_pct: Some(duty),
-                                },
-                            });
                             cx.notify();
                         }),
                     ),
@@ -1314,6 +1325,24 @@ impl ThermiteApp {
             .child(div().text_xs().text_color(TEXT_FAINT).child("0%"))
             .child(track)
             .child(div().text_xs().text_color(TEXT_FAINT).child("100%"))
+    }
+
+    /// Push the current slider duty to the daemon immediately (live
+    /// preview while dragging; the control loop applies it within a tick).
+    fn send_slider_duty(&mut self, fan: FanId) {
+        let duty = self
+            .manual_draft
+            .get(&fan.to_string())
+            .copied()
+            .unwrap_or_else(|| self.fan_duty(fan));
+        self.send(GuiCommand::SetFan {
+            fan,
+            config: FanConfig {
+                mode: FanModeKind::Manual,
+                curve: None,
+                manual_duty_pct: Some(duty),
+            },
+        });
     }
 
     /// Map a slider pointer x to a duty percentage using the stashed
@@ -1738,107 +1767,6 @@ impl ThermiteApp {
                     }))
                     .child("+ Add point"),
             )
-    }
-
-    /// One live-value tile (icon + label + value).
-    fn stat_tile(&self, icon: &'static str, label: &str, value: String, value_color: Hsla) -> Div {
-        h_flex()
-            .gap_3()
-            .items_center()
-            .min_w_0()
-            .border_1()
-            .border_color(BORDER)
-            .rounded_md()
-            .px_4()
-            .py_3()
-            .bg(BG)
-            .child(svg_icon(icon, TEXT_MUTED, 16.))
-            .child(
-                v_flex()
-                    .min_w_0()
-                    .gap_0p5()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(TEXT_MUTED)
-                            .truncate()
-                            .child(label.to_string()),
-                    )
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(value_color)
-                            .truncate()
-                            .child(value),
-                    ),
-            )
-    }
-
-    /// Stat tiles: the genuinely useful per-fan values. `duty` shows a
-    /// duty tile (manual/curve); without it, manual/auto cards show the
-    /// mode-relevant value the caller chose. Row form (manual/auto) or
-    /// column form (curve mode).
-    #[allow(clippy::too_many_arguments)]
-    fn render_fan_stats(
-        &self,
-        fan: FanId,
-        temp: f32,
-        duty: Option<u8>,
-        duty_label: &str,
-        failsafe_label: &str,
-        failsafe_color: Hsla,
-        column: bool,
-    ) -> Div {
-        let hw_rpm = self
-            .status
-            .as_ref()
-            .and_then(|s| s.telemetry.fan(fan))
-            .and_then(|h| h.rpm);
-        let mut tiles = vec![
-            (
-                icons::THERMOMETER,
-                "Current temp".to_string(),
-                format!("{temp:.0}°C"),
-                TEXT,
-            ),
-            (
-                icons::SHIELD_CHECK,
-                "Failsafe".to_string(),
-                failsafe_label.to_string(),
-                failsafe_color,
-            ),
-        ];
-        match duty {
-            Some(d) => tiles.insert(
-                1,
-                (icons::FAN, duty_label.to_string(), format!("{d}%"), TEXT),
-            ),
-            None => tiles.insert(
-                1,
-                (
-                    icons::GAUGE,
-                    duty_label.to_string(),
-                    hw_rpm
-                        .map(|r| format!("{r} rpm"))
-                        .unwrap_or_else(|| "—".into()),
-                    TEXT,
-                ),
-            ),
-        }
-        if column {
-            v_flex().w(px(150.)).flex_none().gap_3().children(
-                tiles
-                    .into_iter()
-                    .map(|(icon, label, value, color)| self.stat_tile(icon, &label, value, color)),
-            )
-        } else {
-            h_flex()
-                .gap_3()
-                .children(tiles.into_iter().map(|(icon, label, value, color)| {
-                    self.stat_tile(icon, &label, value, color).flex_1()
-                }))
-        }
     }
 
     fn render_fans(&self, cx: &Context<Self>) -> impl IntoElement {
