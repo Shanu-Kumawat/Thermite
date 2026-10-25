@@ -52,14 +52,17 @@ active = "balanced"
 # Named curves: strictly increasing temperatures, duty 0-100. A curve's last
 # point is held above its temperature; a single point is a constant duty.
 
+# Duty floors set so fans sit around ~4000 rpm at idle
+# (50% duty ≈ 4k rpm on the ANV15-51's ~8000 rpm max).
+
 [curves.quiet]
-points = [[45, 25], [60, 35], [75, 55], [90, 100]]
+points = [[45, 45], [60, 55], [75, 70], [90, 100]]
 
 [curves.quiet-battery]
-points = [[50, 20], [65, 30], [78, 50], [92, 100]]
+points = [[50, 40], [65, 50], [78, 65], [92, 100]]
 
 [curves.balanced]
-points = [[40, 30], [55, 40], [65, 50], [75, 65], [85, 85], [95, 100]]
+points = [[40, 50], [55, 55], [65, 60], [75, 70], [85, 85], [95, 100]]
 
 [curves.performance]
-points = [[40, 40], [55, 55], [65, 70], [75, 85], [85, 100]]
+points = [[40, 55], [55, 65], [65, 75], [75, 85], [85, 100]]

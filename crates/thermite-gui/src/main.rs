@@ -262,7 +262,9 @@ impl ThermiteApp {
             IpcEvent::Tick(status) => {
                 let telemetry = &status.telemetry; // Box deref
                 self.samples.push_back(Sample {
-                    t: status.daemon.uptime_ms as f64 / 1000.0,
+                    // Window-relative seconds: each tick ≈ 1s, so the chart
+                    // axis reads 0s..240s instead of raw daemon uptime.
+                    t: self.samples.len() as f64,
                     cpu: telemetry.cpu_temp_c().map(f64::from).unwrap_or(0.0),
                     gpu: telemetry.gpu_temp_c().map(f64::from).unwrap_or(0.0),
                     cpu_rpm: telemetry
@@ -939,26 +941,15 @@ impl ThermiteApp {
 
         let curve_points = self.fan_points(fan);
         let curve_duty_now = CurveDef::from_points(curve_points.clone()).duty_at(temp);
-        let (target_speed, target_rpm) = match mode {
-            FanModeKind::Auto => (
-                "Auto".to_string(),
-                hw_rpm
-                    .map(|r| format!("~{r} rpm"))
-                    .unwrap_or_else(|| "—".into()),
-            ),
-            FanModeKind::Manual => {
-                let duty = self.fan_duty(fan);
-                (format!("{duty}%"), format!("~{} rpm", u32::from(duty) * 80))
-            }
-            FanModeKind::Curve => (
-                format!("{curve_duty_now}%"),
-                format!("~{} rpm", u32::from(curve_duty_now) * 80),
-            ),
-        };
-        let mode_label = match mode {
-            FanModeKind::Auto => "Auto",
-            FanModeKind::Manual => "Manual",
-            FanModeKind::Curve => "Curve",
+        let failsafe = self
+            .status
+            .as_ref()
+            .map(|s| s.control.failsafe_phase)
+            .unwrap_or_default();
+        let (failsafe_label, failsafe_color) = match failsafe {
+            FailsafePhase::Normal => ("Normal".to_string(), OK),
+            FailsafePhase::ForceFull => ("Force full".to_string(), ACCENT),
+            FailsafePhase::ReleasedAuto => ("Released to firmware".to_string(), ACCENT),
         };
 
         let curve_mode = mode == FanModeKind::Curve;
@@ -982,16 +973,15 @@ impl ThermiteApp {
             content = content.child(self.render_fan_stats(
                 fan,
                 temp,
-                target_speed,
-                target_rpm,
-                mode_label,
+                Some(curve_duty_now),
+                "Curve duty",
+                &failsafe_label,
+                failsafe_color,
                 true,
             ));
         } else {
-            let (value_color, line_color) = match fan {
-                FanId::Cpu => (ACCENT, ACCENT.opacity(0.9)),
-                FanId::Gpu => (TEXT, TEXT.opacity(0.8)),
-            };
+            // Both fan-speed charts carry the red accent.
+            let (value_color, line_color) = (ACCENT, ACCENT.opacity(0.9));
             let chart_id = match fan {
                 FanId::Cpu => "rpm-chart-cpu",
                 FanId::Gpu => "rpm-chart-gpu",
@@ -1016,17 +1006,23 @@ impl ThermiteApp {
                 5,
                 cx,
             )));
-            content = content.child(
-                h_flex().gap_3().children(
-                    [
-                        (icons::THERMOMETER, "Current temp", format!("{temp:.0}°C")),
-                        (icons::FAN, "Current speed", target_speed),
-                        (icons::GAUGE, "Target rpm", target_rpm),
-                        (icons::SETTINGS, "Control mode", mode_label.to_string()),
-                    ]
-                    .map(|(icon, label, value)| self.stat_tile(icon, label, value).flex_1()),
+            let (duty_label, duty_value) = match mode {
+                FanModeKind::Manual => ("Duty", format!("{}%", self.fan_duty(fan))),
+                _ => (
+                    "Fan rpm",
+                    hw_rpm.map(|r| r.to_string()).unwrap_or_else(|| "—".into()),
                 ),
-            );
+            };
+            content = content.child(self.render_fan_stats(
+                fan,
+                temp,
+                None,
+                duty_label,
+                &failsafe_label,
+                failsafe_color,
+                false,
+            ));
+            let _ = duty_value;
         }
 
         v_flex()
@@ -1161,7 +1157,6 @@ impl ThermiteApp {
     /// Explanatory box shown in Auto mode.
     fn render_auto_info(&self) -> Div {
         div()
-            .flex_1()
             .rounded_md()
             .bg(BG)
             .border_1()
@@ -1746,10 +1741,11 @@ impl ThermiteApp {
     }
 
     /// One live-value tile (icon + label + value).
-    fn stat_tile(&self, icon: &'static str, label: &str, value: String) -> Div {
+    fn stat_tile(&self, icon: &'static str, label: &str, value: String, value_color: Hsla) -> Div {
         h_flex()
             .gap_3()
             .items_center()
+            .min_w_0()
             .border_1()
             .border_color(BORDER)
             .rounded_md()
@@ -1759,52 +1755,89 @@ impl ThermiteApp {
             .child(svg_icon(icon, TEXT_MUTED, 16.))
             .child(
                 v_flex()
+                    .min_w_0()
                     .gap_0p5()
                     .child(
                         div()
                             .text_xs()
                             .text_color(TEXT_MUTED)
+                            .truncate()
                             .child(label.to_string()),
                     )
                     .child(
                         div()
                             .text_sm()
                             .font_weight(FontWeight::MEDIUM)
-                            .text_color(TEXT)
+                            .text_color(value_color)
+                            .truncate()
                             .child(value),
                     ),
             )
     }
 
-    /// Stat tiles: row form (manual/auto) or column form (curve mode).
+    /// Stat tiles: the genuinely useful per-fan values. `duty` shows a
+    /// duty tile (manual/curve); without it, manual/auto cards show the
+    /// mode-relevant value the caller chose. Row form (manual/auto) or
+    /// column form (curve mode).
+    #[allow(clippy::too_many_arguments)]
     fn render_fan_stats(
         &self,
         fan: FanId,
         temp: f32,
-        target_speed: String,
-        target_rpm: String,
-        mode_label: &str,
+        duty: Option<u8>,
+        duty_label: &str,
+        failsafe_label: &str,
+        failsafe_color: Hsla,
         column: bool,
     ) -> Div {
-        let tiles = [
-            (icons::THERMOMETER, "Current temp", format!("{temp:.0}°C")),
-            (icons::FAN, "Current speed", target_speed),
-            (icons::GAUGE, "Target rpm", target_rpm),
-            (icons::SETTINGS, "Control mode", mode_label.to_string()),
+        let hw_rpm = self
+            .status
+            .as_ref()
+            .and_then(|s| s.telemetry.fan(fan))
+            .and_then(|h| h.rpm);
+        let mut tiles = vec![
+            (
+                icons::THERMOMETER,
+                "Current temp".to_string(),
+                format!("{temp:.0}°C"),
+                TEXT,
+            ),
+            (
+                icons::SHIELD_CHECK,
+                "Failsafe".to_string(),
+                failsafe_label.to_string(),
+                failsafe_color,
+            ),
         ];
+        match duty {
+            Some(d) => tiles.insert(
+                1,
+                (icons::FAN, duty_label.to_string(), format!("{d}%"), TEXT),
+            ),
+            None => tiles.insert(
+                1,
+                (
+                    icons::GAUGE,
+                    duty_label.to_string(),
+                    hw_rpm
+                        .map(|r| format!("{r} rpm"))
+                        .unwrap_or_else(|| "—".into()),
+                    TEXT,
+                ),
+            ),
+        }
         if column {
-            let fan_label = if fan == FanId::Cpu { "CPU" } else { "GPU" };
-            v_flex()
-                .w(px(150.))
-                .flex_none()
-                .gap_3()
-                .children(tiles.map(|(icon, label, value)| {
-                    self.stat_tile(icon, &format!("{label} ({fan_label})"), value)
-                }))
-        } else {
-            h_flex().gap_3().children(
-                tiles.map(|(icon, label, value)| self.stat_tile(icon, label, value).flex_1()),
+            v_flex().w(px(150.)).flex_none().gap_3().children(
+                tiles
+                    .into_iter()
+                    .map(|(icon, label, value, color)| self.stat_tile(icon, &label, value, color)),
             )
+        } else {
+            h_flex()
+                .gap_3()
+                .children(tiles.into_iter().map(|(icon, label, value, color)| {
+                    self.stat_tile(icon, &label, value, color).flex_1()
+                }))
         }
     }
 
