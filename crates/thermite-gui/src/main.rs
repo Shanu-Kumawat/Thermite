@@ -14,7 +14,6 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use gpui_kit::component::chart::AreaChart;
-use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::{Icon, Theme, ThemeMode, TitleBar, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -1700,57 +1699,66 @@ impl ThermiteApp {
                 v_flex()
                     .id(SharedString::new(format!("points-{name}")))
                     .gap_1()
-                    .max_h(px(190.))
-                    .overflow_y_scrollbar()
                     .children(points.iter().enumerate().map(|(i, p)| {
                         h_flex()
-                            .gap_2()
+                            .gap_6()
                             .items_center()
                             .px_3()
                             .py_1p5()
                             .rounded_md()
                             .bg(BG)
                             .child(div().size(px(8.)).rounded_full().bg(ACCENT))
-                            // temperature stepper
+                            // temperature cluster: value + its steppers
                             .child(
-                                div()
-                                    .w(px(56.))
-                                    .text_sm()
-                                    .text_color(TEXT)
-                                    .child(format!("{:.0}°C", p.0)),
+                                h_flex()
+                                    .gap_1()
+                                    .items_center()
+                                    .child(
+                                        div()
+                                            .w(px(48.))
+                                            .text_sm()
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(TEXT)
+                                            .child(format!("{:.0}°C", p.0)),
+                                    )
+                                    .child(self.stepper(format!("pt-t-{name}-{i}"), "−", {
+                                        let points = points.to_vec();
+                                        cx.listener(move |this, _ev: &ClickEvent, _window, _cx| {
+                                            this.adjust_point(fan, i, &points, -5.0, 0);
+                                        })
+                                    }))
+                                    .child(self.stepper(format!("pt-t+{name}-{i}"), "+", {
+                                        let points = points.to_vec();
+                                        cx.listener(move |this, _ev: &ClickEvent, _window, _cx| {
+                                            this.adjust_point(fan, i, &points, 5.0, 0);
+                                        })
+                                    })),
                             )
-                            .child(self.stepper(format!("pt-t-{name}-{i}"), "−", {
-                                let points = points.to_vec();
-                                cx.listener(move |this, _ev: &ClickEvent, _window, _cx| {
-                                    this.adjust_point(fan, i, &points, -5.0, 0);
-                                })
-                            }))
-                            .child(self.stepper(format!("pt-t+{name}-{i}"), "+", {
-                                let points = points.to_vec();
-                                cx.listener(move |this, _ev: &ClickEvent, _window, _cx| {
-                                    this.adjust_point(fan, i, &points, 5.0, 0);
-                                })
-                            }))
-                            // duty stepper
+                            // duty cluster: value + its steppers
                             .child(
-                                div()
-                                    .w(px(48.))
-                                    .text_sm()
-                                    .text_color(TEXT_MUTED)
-                                    .child(format!("{}%", p.1)),
+                                h_flex()
+                                    .gap_1()
+                                    .items_center()
+                                    .child(
+                                        div()
+                                            .w(px(44.))
+                                            .text_sm()
+                                            .text_color(TEXT_MUTED)
+                                            .child(format!("{}%", p.1)),
+                                    )
+                                    .child(self.stepper(format!("pt-d-{name}-{i}"), "−", {
+                                        let points = points.to_vec();
+                                        cx.listener(move |this, _ev: &ClickEvent, _window, _cx| {
+                                            this.adjust_point(fan, i, &points, 0.0, -5);
+                                        })
+                                    }))
+                                    .child(self.stepper(format!("pt-d+{name}-{i}"), "+", {
+                                        let points = points.to_vec();
+                                        cx.listener(move |this, _ev: &ClickEvent, _window, _cx| {
+                                            this.adjust_point(fan, i, &points, 0.0, 5);
+                                        })
+                                    })),
                             )
-                            .child(self.stepper(format!("pt-d-{name}-{i}"), "−", {
-                                let points = points.to_vec();
-                                cx.listener(move |this, _ev: &ClickEvent, _window, _cx| {
-                                    this.adjust_point(fan, i, &points, 0.0, -5);
-                                })
-                            }))
-                            .child(self.stepper(format!("pt-d+{name}-{i}"), "+", {
-                                let points = points.to_vec();
-                                cx.listener(move |this, _ev: &ClickEvent, _window, _cx| {
-                                    this.adjust_point(fan, i, &points, 0.0, 5);
-                                })
-                            }))
                             .child(div().flex_1())
                             .when(points.len() > 1, |this| {
                                 this.child(
@@ -1855,7 +1863,6 @@ impl ThermiteApp {
         v_flex()
             .p_5()
             .gap_5()
-            .flex_1()
             .child(
                 v_flex()
                     .gap_1()
