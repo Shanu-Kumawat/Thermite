@@ -66,13 +66,12 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum FanSpec {
-    /// CPU fan
-    Cpu {
-        #[command(subcommand)]
-        action: FanAction,
-    },
-    /// GPU fan
-    Gpu {
+    /// List fans reported by the driver
+    List,
+    /// Apply an action to one fan by name (e.g. cpu, gpu)
+    Set {
+        /// Fan name — see `thermite fan list`
+        name: String,
         #[command(subcommand)]
         action: FanAction,
     },
@@ -346,10 +345,20 @@ fn phase_str(control: &ControlSnapshot) -> &'static str {
 // ---------- fan ----------
 
 fn set_fan(socket: &Path, fan: FanSpec) -> Result<()> {
-    let (fan, action) = match fan {
-        FanSpec::Cpu { action } => (FanId::Cpu, action),
-        FanSpec::Gpu { action } => (FanId::Gpu, action),
+    if let FanSpec::List = fan {
+        let mut client = connect(socket)?;
+        let Response::Status { status } = client.call(Request::GetStatus)? else {
+            bail!("unexpected response");
+        };
+        for f in &status.control.fans {
+            println!("{:<12} {}", f.id, configured_str_raw(&f.config));
+        }
+        return Ok(());
+    }
+    let FanSpec::Set { name, action } = fan else {
+        unreachable!("list handled above");
     };
+    let fan = FanId::new(&name);
     let config = match action {
         FanAction::Auto => FanConfig {
             mode: FanModeKind::Auto,
@@ -370,7 +379,7 @@ fn set_fan(socket: &Path, fan: FanSpec) -> Result<()> {
     };
     let mut client = connect(socket)?;
     match client.call(Request::SetFanConfig {
-        fan,
+        fan: fan.clone(),
         config: config.clone(),
     })? {
         Response::Ok => {
@@ -553,9 +562,13 @@ fn doctor(json: bool) -> Result<()> {
         println!("  acer_wmi.predator_v4 = {p}");
     }
     println!();
-    println!("acer-wmi capability: {:?}", report.level);
-    if let Some(h) = &report.acer_wmi_hwmon {
-        println!("  hwmon: {h}");
+    println!(
+        "driver: {} (capability {:?})",
+        report.driver.as_deref().unwrap_or("none matched"),
+        report.level
+    );
+    if let Some(h) = &report.driver_detail {
+        println!("  detail: {h}");
     }
     for note in &report.notes {
         println!("  - {note}");

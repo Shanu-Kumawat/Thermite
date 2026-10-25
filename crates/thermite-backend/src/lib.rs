@@ -22,11 +22,13 @@ pub mod nvml;
 pub mod power;
 pub mod sysfs;
 
-pub use drivers::{Driver, DriverMatch};
 pub use drivers::acer_wmi::AcerWmiBackend;
+pub use drivers::{Driver, DriverMatch};
 pub use fake::{FakeBackend, WriteOp};
 
-use thermite_core::{Backend, BackendError, CapabilityReport, FanDescriptor, FanId, HwFanMode, Telemetry};
+use thermite_core::{
+    Backend, BackendError, CapabilityReport, FanDescriptor, FanId, HwFanMode, Telemetry,
+};
 
 /// Composite backend: the matched device driver + generic sensors + NVML,
 /// layered so telemetry works even when no driver matches.
@@ -61,10 +63,7 @@ impl Default for ThermiteBackend {
 
 impl Backend for ThermiteBackend {
     fn fans(&self) -> &[FanDescriptor] {
-        self.driver
-            .as_ref()
-            .map(|d| d.fans())
-            .unwrap_or(&[])
+        self.driver.as_ref().map(|d| d.fans()).unwrap_or(&[])
     }
 
     fn capability(&self) -> CapabilityReport {

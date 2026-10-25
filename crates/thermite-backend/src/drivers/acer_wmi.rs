@@ -76,9 +76,7 @@ impl AcerWmiBackend {
 
     fn attr_file(&self, fan: &FanId, attr: &str) -> Option<PathBuf> {
         let n = Self::fan_index(fan)?;
-        self.hwmon
-            .as_ref()
-            .map(|h| h.join(format!("{attr}{n}")))
+        self.hwmon.as_ref().map(|h| h.join(format!("{attr}{n}")))
     }
 
     /// pwm value file — `pwmN` in the mainline driver; some kernels use
@@ -183,9 +181,8 @@ impl Backend for AcerWmiBackend {
                     crate::sysfs::parse_num::<u32>(&hwmon.join(format!("pwm{n}"))).or_else(|| {
                         crate::sysfs::parse_num::<u32>(&hwmon.join(format!("pwm{n}_input")))
                     });
-                let hw_mode =
-                    crate::sysfs::parse_num::<u8>(&hwmon.join(format!("pwm{n}_enable")))
-                        .and_then(hw_mode_from_enable);
+                let hw_mode = crate::sysfs::parse_num::<u8>(&hwmon.join(format!("pwm{n}_enable")))
+                    .and_then(hw_mode_from_enable);
                 telemetry.fans.push(FanTelemetry {
                     id: fan.id.clone(),
                     rpm,
@@ -234,9 +231,9 @@ impl Backend for AcerWmiBackend {
     }
 
     fn set_fan_duty(&mut self, fan: &FanId, duty_pct: u8) -> Result<(), BackendError> {
-        let file = self
-            .pwm_value(fan)
-            .ok_or_else(|| BackendError::Unsupported(format!("no pwm control for fan \"{fan}\"")))?;
+        let file = self.pwm_value(fan).ok_or_else(|| {
+            BackendError::Unsupported(format!("no pwm control for fan \"{fan}\""))
+        })?;
         if self.capability.level != CapabilityLevel::Full {
             return Err(BackendError::Unsupported(
                 "manual fan control unavailable at this capability level".to_string(),
@@ -311,7 +308,10 @@ mod tests {
             &root.join("sys/firmware/acpi/platform_profile_choices"),
             "low-power quiet balanced balanced-performance performance\n",
         );
-        write(&root.join("sys/firmware/acpi/platform_profile"), "balanced\n");
+        write(
+            &root.join("sys/firmware/acpi/platform_profile"),
+            "balanced\n",
+        );
 
         write(&root.join("sys/class/power_supply/ACAD/type"), "Mains");
         write(&root.join("sys/class/power_supply/ACAD/online"), "1");
@@ -456,7 +456,10 @@ mod tests {
             &root.join("sys/firmware/acpi/platform_profile_choices"),
             "quiet balanced\n",
         );
-        write(&root.join("sys/firmware/acpi/platform_profile"), "balanced\n");
+        write(
+            &root.join("sys/firmware/acpi/platform_profile"),
+            "balanced\n",
+        );
 
         let mut b = AcerWmiBackend::with_root(root);
         assert_eq!(b.capability().level, CapabilityLevel::MonitorProfiles);

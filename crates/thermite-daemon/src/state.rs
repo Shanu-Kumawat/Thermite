@@ -192,6 +192,7 @@ impl SharedState {
     /// Build the control snapshot for IPC.
     pub fn control_snapshot(&self) -> ControlSnapshot {
         ControlSnapshot {
+            fan_info: self.fan_descriptors.clone(),
             fans: self
                 .fans
                 .iter()

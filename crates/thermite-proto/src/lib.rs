@@ -19,7 +19,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use thermite_core::{
-    CapabilityReport, Config, CurvePoint, FailsafePhase, FanConfig, FanId, Telemetry,
+    CapabilityReport, Config, CurvePoint, FailsafePhase, FanConfig, FanDescriptor, FanId, Telemetry,
 };
 use thiserror::Error;
 
@@ -138,6 +138,8 @@ pub struct FanRuntimeState {
 /// Control-loop state published with every tick and in status.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct ControlSnapshot {
+    /// Fans the driver reports (labels + temp sources).
+    pub fan_info: Vec<FanDescriptor>,
     /// Per-fan runtime state.
     pub fans: Vec<FanRuntimeState>,
     /// Current failsafe phase.
@@ -455,7 +457,7 @@ mod tests {
         Frame::Request {
             id: 7,
             request: Request::SetFanConfig {
-                fan: FanId::Cpu,
+                fan: FanId::new("cpu"),
                 config: FanConfig {
                     mode: thermite_core::config::FanModeKind::Curve,
                     curve: Some("balanced".to_string()),

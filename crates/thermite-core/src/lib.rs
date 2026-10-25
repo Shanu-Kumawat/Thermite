@@ -27,7 +27,7 @@ pub use config::{Config, ConfigError, FanConfig, FanModeKind, GeneralConfig, Pla
 pub use curve::{CurveDef, CurveError, CurvePoint};
 pub use failsafe::{FailsafeEngine, FailsafePhase, FailsafeThresholds, PhaseDirective};
 pub use hysteresis::Hysteresis;
-pub use profile::{PlatformProfile, KNOWN_PROFILES};
+pub use profile::{KNOWN_PROFILES, PlatformProfile};
 pub use sensors::{
     Backend, BackendError, CapabilityLevel, CapabilityReport, FanDescriptor, FanId, FanTelemetry,
     GpuTelemetry, HwFanMode, Telemetry, TempClass, TempSource, TempTelemetry,

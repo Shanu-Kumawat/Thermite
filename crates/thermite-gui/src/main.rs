@@ -19,7 +19,10 @@ use gpui_kit::component::{Icon, Theme, ThemeMode, TitleBar, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use thermite_core::config::{Config, FanConfig, FanModeKind};
-use thermite_core::{CapabilityLevel, CurveDef, CurvePoint, FailsafePhase, FanId, HwFanMode};
+use thermite_core::{
+    CapabilityLevel, CurveDef, CurvePoint, FailsafePhase, FanDescriptor, FanId, HwFanMode,
+    TempSource,
+};
 use thermite_proto::{
     Alert, AlertLevel, Client, DEFAULT_SOCKET_PATH, DaemonInfo, Event, Request, Response,
     StatusSnapshot,
@@ -116,14 +119,14 @@ use ui::{
     ACCENT, ACCENT_DIM, BG, BORDER, OK, SURFACE, SURFACE_RAISED, TEXT, TEXT_FAINT, TEXT_MUTED, WARN,
 };
 
-/// One telemetry sample for the charts.
+/// One telemetry sample for the charts. Fan RPMs are keyed by fan name so
+/// any number of fans charts off the same history.
 #[derive(Clone)]
 struct Sample {
     t: f64,
     cpu: f64,
     gpu: f64,
-    cpu_rpm: f64,
-    gpu_rpm: f64,
+    rpm: std::collections::BTreeMap<String, f64>,
 }
 
 /// Events delivered from IPC threads into the UI.
@@ -153,6 +156,8 @@ enum GuiCommand {
         name: String,
         points: Vec<CurvePoint>,
     },
+    /// Delete a curve.
+    DeleteCurve { name: String },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -272,22 +277,18 @@ impl ThermiteApp {
             }
             IpcEvent::Tick(status) => {
                 let telemetry = &status.telemetry; // Box deref
+                let rpm = telemetry
+                    .fans
+                    .iter()
+                    .filter_map(|f| f.rpm.map(|r| (f.id.to_string(), f64::from(r))))
+                    .collect();
                 self.samples.push_back(Sample {
                     // Window-relative seconds: each tick ≈ 1s, so the chart
                     // axis reads 0s..240s instead of raw daemon uptime.
                     t: self.samples.len() as f64,
                     cpu: telemetry.cpu_temp_c().map(f64::from).unwrap_or(0.0),
                     gpu: telemetry.gpu_temp_c().map(f64::from).unwrap_or(0.0),
-                    cpu_rpm: telemetry
-                        .fan(FanId::Cpu)
-                        .and_then(|f| f.rpm)
-                        .map(f64::from)
-                        .unwrap_or(0.0),
-                    gpu_rpm: telemetry
-                        .fan(FanId::Gpu)
-                        .and_then(|f| f.rpm)
-                        .map(f64::from)
-                        .unwrap_or(0.0),
+                    rpm,
                 });
                 while self.samples.len() > MAX_SAMPLES {
                     self.samples.pop_front();
@@ -320,10 +321,64 @@ impl ThermiteApp {
         }
     }
 
-    fn fan_state(&self, fan: FanId) -> Option<&thermite_proto::FanRuntimeState> {
+    fn fan_state(&self, fan: &FanId) -> Option<&thermite_proto::FanRuntimeState> {
         self.status
             .as_ref()
-            .and_then(|s| s.control.fans.iter().find(|f| f.id == fan))
+            .and_then(|s| s.control.fans.iter().find(|f| &f.id == fan))
+    }
+
+    /// The driver's descriptor for a fan (labels/temp source), with a sane
+    /// fallback before the first status snapshot arrives.
+    fn fan_descriptor(&self, fan: &FanId) -> FanDescriptor {
+        if let Some(d) = self
+            .status
+            .as_ref()
+            .and_then(|s| s.control.fan_info.iter().find(|d| &d.id == fan))
+        {
+            return d.clone();
+        }
+        FanDescriptor {
+            id: fan.clone(),
+            label: format!("{} Fan", pretty_curve_name(fan.as_str())),
+            temp_source: if fan.as_str() == "gpu" {
+                TempSource::Gpu
+            } else {
+                TempSource::Cpu
+            },
+        }
+    }
+
+    /// Fans to render, from the daemon snapshot (driver-reported order).
+    fn fan_ids(&self) -> Vec<FanId> {
+        let from_info = self
+            .status
+            .as_ref()
+            .map(|s| {
+                s.control
+                    .fan_info
+                    .iter()
+                    .map(|d| d.id.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if !from_info.is_empty() {
+            return from_info;
+        }
+        let from_runtime = self
+            .status
+            .as_ref()
+            .map(|s| {
+                s.control
+                    .fans
+                    .iter()
+                    .map(|f| f.id.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if !from_runtime.is_empty() {
+            return from_runtime;
+        }
+        vec![FanId::new("cpu"), FanId::new("gpu")]
     }
 
     fn default_curve_name(&self) -> String {
@@ -342,7 +397,7 @@ impl ThermiteApp {
     // ---------- fan page helpers ----------
 
     /// The curve a fan currently follows (config-selected, or the default).
-    fn fan_curve_name(&self, fan: FanId) -> String {
+    fn fan_curve_name(&self, fan: &FanId) -> String {
         self.fan_state(fan)
             .and_then(|r| r.config.curve.clone())
             .filter(|c| self.config.curves.contains_key(c))
@@ -351,7 +406,7 @@ impl ThermiteApp {
 
     /// The points shown in a fan's curve editor: the local draft while
     /// editing, otherwise the committed curve.
-    fn fan_points(&self, fan: FanId) -> Vec<CurvePoint> {
+    fn fan_points(&self, fan: &FanId) -> Vec<CurvePoint> {
         if let Some(draft) = self.curve_draft.get(&fan.to_string()) {
             return draft.clone();
         }
@@ -363,7 +418,7 @@ impl ThermiteApp {
     }
 
     /// The duty shown for a fan in manual mode: slider preview or committed.
-    fn fan_duty(&self, fan: FanId) -> u8 {
+    fn fan_duty(&self, fan: &FanId) -> u8 {
         if let Some(d) = self.manual_draft.get(&fan.to_string()) {
             return *d;
         }
@@ -375,9 +430,9 @@ impl ThermiteApp {
     /// Validate and commit a curve edit: preview locally, push to the
     /// daemon (which persists it); invalid curves are rejected silently —
     /// the editor falls back to the last committed state.
-    fn commit_curve(&mut self, fan: FanId, points: Vec<CurvePoint>) {
+    fn commit_curve(&mut self, fan: &FanId, points: Vec<CurvePoint>) {
         if points.is_empty() || CurveDef::validated(points.clone()).is_err() {
-            self.curve_draft.remove(&fan.to_string());
+            self.curve_draft.remove(fan.as_str());
             return;
         }
         self.curve_draft.insert(fan.to_string(), points.clone());
@@ -639,8 +694,8 @@ impl ThermiteApp {
     #[allow(clippy::too_many_arguments)]
     fn render_metric_card(
         &self,
-        id: &'static str,
-        title: &str,
+        id: impl Into<SharedString>,
+        title: impl Into<SharedString>,
         icon: &'static str,
         icon_color: Hsla,
         value_color: Hsla,
@@ -662,7 +717,7 @@ impl ThermiteApp {
         let domain = y_domain;
         let intervals = (ticks.max(2) - 1) as f64;
         v_flex()
-            .id(id)
+            .id(id.into())
             .flex_1()
             .gap_2()
             .border_1()
@@ -685,7 +740,7 @@ impl ThermiteApp {
                                     .text_sm()
                                     .font_weight(FontWeight::MEDIUM)
                                     .text_color(TEXT)
-                                    .child(title.to_string()),
+                                    .child(Into::<SharedString>::into(title)),
                             ),
                     )
                     .child(
@@ -811,7 +866,7 @@ impl ThermiteApp {
                                     .text_sm()
                                     .font_weight(FontWeight::MEDIUM)
                                     .text_color(TEXT)
-                                    .child(title.to_string()),
+                                    .child(Into::<SharedString>::into(title)),
                             ),
                     )
                     .child(svg_icon(icons::LIST_FILTER, TEXT_MUTED, 14.)),
@@ -888,40 +943,42 @@ impl ThermiteApp {
                         cx,
                     )),
             )
-            .child(
-                h_flex()
-                    .gap_4()
-                    .flex_1()
-                    .items_stretch()
-                    .child(self.render_metric_card(
-                        "chart-cpu-fan",
-                        "CPU fan",
-                        icons::FAN,
-                        ACCENT,
-                        TEXT,
-                        TEXT.opacity(0.8),
-                        "rpm",
-                        &samples,
-                        |d| d.cpu_rpm,
-                        (0.0, 8000.0),
-                        5,
-                        cx,
-                    ))
-                    .child(self.render_metric_card(
-                        "chart-gpu-fan",
-                        "GPU fan",
-                        icons::FAN,
-                        ACCENT,
-                        TEXT,
-                        TEXT.opacity(0.8),
-                        "rpm",
-                        &samples,
-                        |d| d.gpu_rpm,
-                        (0.0, 8000.0),
-                        5,
-                        cx,
-                    )),
-            )
+            .children({
+                // One speed chart per driver-reported fan, two per row.
+                let fans = self.fan_ids();
+                fans.chunks(2)
+                    .map(|chunk| {
+                        h_flex()
+                            .gap_4()
+                            .flex_1()
+                            .items_stretch()
+                            .children(chunk.iter().map(|fan| {
+                                let id = fan.to_string();
+                                let label = format!("{} fan", pretty_curve_name(fan.as_str()));
+                                let key = id.clone();
+                                let chart_id = format!("chart-fan-{id}");
+                                self.render_metric_card(
+                                    chart_id,
+                                    label,
+                                    icons::FAN,
+                                    ACCENT,
+                                    TEXT,
+                                    TEXT.opacity(0.8),
+                                    "rpm",
+                                    &samples,
+                                    move |d: &Sample| d.rpm.get(&key).copied().unwrap_or(0.0),
+                                    (0.0, 8000.0),
+                                    5,
+                                    cx,
+                                )
+                            }))
+                            .when(chunk.len() == 1, |this| {
+                                // Keep the single chart from doubling width.
+                                this.child(div().flex_1())
+                            })
+                    })
+                    .collect::<Vec<_>>()
+            })
             .child(
                 // Sensors: two cards side by side — hottest half on the left
                 // so the ranking still reads naturally. 8 rows per card.
@@ -939,22 +996,25 @@ impl ThermiteApp {
             )
     }
 
-    fn render_fan_card(&self, fan: FanId, cx: &Context<Self>) -> impl IntoElement {
+    fn render_fan_card(&self, fan: &FanId, cx: &Context<Self>) -> impl IntoElement {
         let name = fan.to_string();
         let rt = self.fan_state(fan);
         let hw = self.status.as_ref().and_then(|s| s.telemetry.fan(fan));
         let mode = rt.map(|r| r.config.mode).unwrap_or_default();
         let hw_rpm = hw.and_then(|h| h.rpm);
         let hw_label = hw.and_then(|h| h.hw_mode).map(hw_mode_str).unwrap_or("—");
-        let temp = match fan {
-            FanId::Cpu => self.status.as_ref().and_then(|s| s.telemetry.cpu_temp_c()),
-            FanId::Gpu => self.status.as_ref().and_then(|s| s.telemetry.gpu_temp_c()),
-        }
-        .unwrap_or(0.0);
-        let (title, sub) = match fan {
-            FanId::Cpu => ("CPU Fan", "Controls the left fan (CPU)"),
-            FanId::Gpu => ("GPU Fan", "Controls the right fan (GPU)"),
-        };
+        let descriptor = self.fan_descriptor(fan);
+        let temp = self
+            .status
+            .as_ref()
+            .and_then(|s| s.telemetry.temp_for(&descriptor.temp_source))
+            .unwrap_or(0.0);
+        let title = descriptor.label.clone();
+        let sub = format!(
+            "Fan \"{}\" driven by {}",
+            fan,
+            temp_source_str(&descriptor.temp_source)
+        );
 
         let curve_points = self.fan_points(fan);
         let curve_mode = mode == FanModeKind::Curve;
@@ -975,6 +1035,7 @@ impl ThermiteApp {
                 }),
         );
 
+        let name_key = fan.to_string();
         if curve_mode {
             content = content.child(self.render_curve_panel(fan, &curve_points, cx));
         } else {
@@ -985,26 +1046,17 @@ impl ThermiteApp {
             } else {
                 (TEXT, TEXT.opacity(0.8))
             };
-            let chart_id = match fan {
-                FanId::Cpu => "rpm-chart-cpu",
-                FanId::Gpu => "rpm-chart-gpu",
-            };
+            let chart_id = format!("rpm-chart-{fan}");
             content = content.child(div().flex_1().min_w_0().child(self.render_metric_card(
-                chart_id,
-                &format!(
-                    "Fan speed ({})",
-                    if fan == FanId::Cpu { "CPU" } else { "GPU" }
-                ),
+                &chart_id,
+                &format!("Fan speed ({fan})"),
                 icons::CHART_LINE,
                 TEXT_MUTED,
                 value_color,
                 line_color,
                 "rpm",
                 &self.samples.iter().cloned().collect::<Vec<Sample>>(),
-                move |d: &Sample| match fan {
-                    FanId::Cpu => d.cpu_rpm,
-                    FanId::Gpu => d.gpu_rpm,
-                },
+                move |d: &Sample| d.rpm.get(&name_key).copied().unwrap_or(0.0),
                 (0.0, 8000.0),
                 5,
                 cx,
@@ -1028,13 +1080,13 @@ impl ThermiteApp {
                         h_flex()
                             .gap_3()
                             .items_center()
-                            .child(match fan {
-                                FanId::Cpu => {
-                                    svg_icon(icons::SETTINGS, ACCENT, 20.).into_any_element()
-                                }
-                                FanId::Gpu => {
-                                    svg_icon(icons::MONITOR, ACCENT, 20.).into_any_element()
-                                }
+                            .child({
+                                let icon = if fan.as_str() == "cpu" {
+                                    icons::SETTINGS
+                                } else {
+                                    icons::MONITOR
+                                };
+                                svg_icon(icon, ACCENT, 20.).into_any_element()
                             })
                             .child(
                                 v_flex()
@@ -1102,7 +1154,7 @@ impl ThermiteApp {
     /// Segmented Auto / Manual / Curve mode selector.
     fn render_mode_buttons(
         &self,
-        fan: FanId,
+        fan: &FanId,
         mode: FanModeKind,
         cx: &Context<Self>,
     ) -> impl IntoElement {
@@ -1114,6 +1166,7 @@ impl ThermiteApp {
             ]
             .map(|(kind, label)| {
                 let active = mode == kind;
+                let fan = fan.clone();
                 div()
                     .id(SharedString::new(format!("mode-{}-{label}", fan)))
                     .px_5()
@@ -1141,16 +1194,19 @@ impl ThermiteApp {
                             FanModeKind::Manual => FanConfig {
                                 mode: FanModeKind::Manual,
                                 curve: None,
-                                manual_duty_pct: Some(this.fan_duty(fan)),
+                                manual_duty_pct: Some(this.fan_duty(&fan)),
                             },
                             FanModeKind::Curve => FanConfig {
                                 mode: FanModeKind::Curve,
-                                curve: Some(this.fan_curve_name(fan)),
+                                curve: Some(this.fan_curve_name(&fan)),
                                 manual_duty_pct: None,
                             },
                         };
                         this.manual_draft.remove(&fan.to_string());
-                        this.send(GuiCommand::SetFan { fan, config });
+                        this.send(GuiCommand::SetFan {
+                            fan: fan.clone(),
+                            config,
+                        });
                         cx.notify();
                     }))
                     .child(label)
@@ -1187,7 +1243,7 @@ impl ThermiteApp {
     }
 
     /// Manual-mode control: duty label + big percentage + slider.
-    fn render_manual_control(&self, fan: FanId, cx: &Context<Self>) -> Div {
+    fn render_manual_control(&self, fan: &FanId, cx: &Context<Self>) -> Div {
         let duty = self.fan_duty(fan);
         v_flex()
             .flex_1()
@@ -1215,7 +1271,9 @@ impl ThermiteApp {
     }
 
     /// Custom duty slider: red fill, draggable thumb; commits on release.
-    fn render_duty_slider(&self, fan: FanId, duty: u8, cx: &Context<Self>) -> Div {
+    fn render_duty_slider(&self, fan: &FanId, duty: u8, cx: &Context<Self>) -> Div {
+        let fan = fan.clone();
+        let fan = fan.clone();
         let name = fan.to_string();
         let bounds_cell: Rc<RefCell<Option<Bounds<Pixels>>>> = Rc::default();
         let frac = f32::from(duty) / 100.0;
@@ -1270,6 +1328,7 @@ impl ThermiteApp {
                     .on_mouse_down(MouseButton::Left, {
                         let bounds_cell = Rc::clone(&bounds_cell);
                         let name = name.clone();
+                        let fan = fan.clone();
                         cx.listener(move |this, ev: &MouseDownEvent, _window, cx| {
                             if let Some(duty) =
                                 this.slider_duty_at(&name, *bounds_cell.borrow(), ev.position.x)
@@ -1282,7 +1341,7 @@ impl ThermiteApp {
                                     .is_none_or(|(f, t)| f != &name || t.elapsed() >= THROTTLE);
                                 if due {
                                     this.last_slider_send = Some((name.clone(), Instant::now()));
-                                    this.send_slider_duty(fan);
+                                    this.send_slider_duty(fan.clone());
                                 }
                                 cx.notify();
                             }
@@ -1291,41 +1350,45 @@ impl ThermiteApp {
                     .on_mouse_move({
                         let bounds_cell = Rc::clone(&bounds_cell);
                         let name = name.clone();
-                        cx.listener(move |this, ev: &MouseMoveEvent, _window, cx| {
-                            if this.slider_drag.as_deref() != Some(name.as_str())
-                                || ev.pressed_button != Some(MouseButton::Left)
-                            {
-                                return;
-                            }
-                            if let Some(duty) =
-                                this.slider_duty_at(&name, *bounds_cell.borrow(), ev.position.x)
-                            {
-                                this.manual_draft.insert(name.clone(), duty);
-                                let due = this
-                                    .last_slider_send
-                                    .as_ref()
-                                    .is_none_or(|(f, t)| f != &name || t.elapsed() >= THROTTLE);
-                                if due {
-                                    this.last_slider_send = Some((name.clone(), Instant::now()));
-                                    this.send_slider_duty(fan);
+                        cx.listener({
+                            let fan = fan.clone();
+                            move |this, ev: &MouseMoveEvent, _window, cx| {
+                                if this.slider_drag.as_deref() != Some(name.as_str())
+                                    || ev.pressed_button != Some(MouseButton::Left)
+                                {
+                                    return;
                                 }
-                                cx.notify();
+                                if let Some(duty) =
+                                    this.slider_duty_at(&name, *bounds_cell.borrow(), ev.position.x)
+                                {
+                                    this.manual_draft.insert(name.clone(), duty);
+                                    let due = this
+                                        .last_slider_send
+                                        .as_ref()
+                                        .is_none_or(|(f, t)| f != &name || t.elapsed() >= THROTTLE);
+                                    if due {
+                                        this.last_slider_send =
+                                            Some((name.clone(), Instant::now()));
+                                        this.send_slider_duty(fan.clone());
+                                    }
+                                    cx.notify();
+                                }
                             }
                         })
                     })
-                    .on_mouse_up(
-                        MouseButton::Left,
+                    .on_mouse_up(MouseButton::Left, {
+                        let fan = fan.clone();
                         cx.listener(move |this, _ev: &MouseUpEvent, _window, cx| {
                             if this.slider_drag.as_deref() != Some(name.as_str()) {
                                 return;
                             }
                             this.slider_drag = None;
                             this.last_slider_send = None;
-                            this.send_slider_duty(fan);
+                            this.send_slider_duty(fan.clone());
                             this.manual_draft.remove(&fan.to_string());
                             cx.notify();
-                        }),
-                    ),
+                        })
+                    }),
             );
 
         h_flex()
@@ -1343,7 +1406,7 @@ impl ThermiteApp {
             .manual_draft
             .get(&fan.to_string())
             .copied()
-            .unwrap_or_else(|| self.fan_duty(fan));
+            .unwrap_or_else(|| self.fan_duty(&fan));
         self.send(GuiCommand::SetFan {
             fan,
             config: FanConfig {
@@ -1370,11 +1433,12 @@ impl ThermiteApp {
     /// from the same points; the overlay div only handles drag events.
     fn render_curve_graph(
         &self,
-        fan: FanId,
+        fan: &FanId,
         points: &[CurvePoint],
         temp: f32,
         cx: &Context<Self>,
     ) -> Div {
+        let fan = fan.clone();
         let name = fan.to_string();
         let bounds_cell: Rc<RefCell<Option<Bounds<Pixels>>>> = Rc::default();
         let pts: Vec<(f32, f32)> = points.iter().map(|p| (p.0, f32::from(p.1))).collect();
@@ -1384,7 +1448,7 @@ impl ThermiteApp {
         let actual_duty = self
             .status
             .as_ref()
-            .and_then(|s| s.telemetry.fan(fan))
+            .and_then(|s| s.telemetry.fan(&fan))
             .and_then(|h| h.duty_pct)
             .unwrap_or_else(|| CurveDef::from_points(points.to_vec()).duty_at(temp));
         let drag_idx = self
@@ -1506,11 +1570,12 @@ impl ThermiteApp {
             .on_mouse_down(MouseButton::Left, {
                 let bounds_cell = Rc::clone(&bounds_cell);
                 let name = name.clone();
+                let fan = fan.clone();
                 cx.listener(move |this, ev: &MouseDownEvent, _window, cx| {
                     let Some(bounds) = *bounds_cell.borrow() else {
                         return;
                     };
-                    let pts = this.fan_points(fan);
+                    let pts = this.fan_points(&fan);
                     let rel_x = f32::from(ev.position.x - bounds.origin.x);
                     let rel_y = f32::from(ev.position.y - bounds.origin.y);
                     let mut best: Option<(usize, f32)> = None;
@@ -1532,6 +1597,7 @@ impl ThermiteApp {
             .on_mouse_move({
                 let bounds_cell = Rc::clone(&bounds_cell);
                 let name = name.clone();
+                let fan = fan.clone();
                 cx.listener(move |this, ev: &MouseMoveEvent, _window, cx| {
                     let Some((f, idx)) = this.drag_point.clone() else {
                         return;
@@ -1545,7 +1611,7 @@ impl ThermiteApp {
                     if f32::from(bounds.size.width) <= 0.0 || f32::from(bounds.size.height) <= 0.0 {
                         return;
                     }
-                    let mut pts = this.fan_points(fan);
+                    let mut pts = this.fan_points(&fan);
                     let Some(_slot) = pts.get_mut(idx) else {
                         return;
                     };
@@ -1573,6 +1639,7 @@ impl ThermiteApp {
             })
             .on_mouse_up(MouseButton::Left, {
                 let name = name.clone();
+                let fan = fan.clone();
                 cx.listener(move |this, _ev: &MouseUpEvent, _window, cx| {
                     let Some((f, _)) = this.drag_point.clone() else {
                         return;
@@ -1582,14 +1649,14 @@ impl ThermiteApp {
                     }
                     let points = this.curve_draft.get(&name).cloned();
                     if let Some(points) = points {
-                        this.commit_curve(fan, points);
+                        this.commit_curve(&fan, points);
                     }
                     this.drag_point = None;
                     cx.notify();
                 })
             });
 
-        let fan_label = if fan == FanId::Cpu { "CPU" } else { "GPU" };
+        let fan_label = pretty_curve_name(fan.as_str());
 
         v_flex()
             .flex_1()
@@ -1651,9 +1718,10 @@ impl ThermiteApp {
 
     /// Curve-mode right panel: presets, and the point list with full
     /// editing (temp/duty steppers, remove, add).
-    fn render_curve_panel(&self, fan: FanId, points: &[CurvePoint], cx: &Context<Self>) -> Div {
+    fn render_curve_panel(&self, fan: &FanId, points: &[CurvePoint], cx: &Context<Self>) -> Div {
+        let fan = fan.clone();
         let name = fan.to_string();
-        let active_curve = self.fan_curve_name(fan);
+        let active_curve = self.fan_curve_name(&fan);
         let curves: Vec<String> = self.config.curves.keys().cloned().collect();
 
         v_flex()
@@ -1692,10 +1760,11 @@ impl ThermiteApp {
                             })
                             .on_click(cx.listener({
                                 let cname = cname.clone();
+                                let fan = fan.clone();
                                 move |this, _ev: &ClickEvent, _window, cx| {
                                     this.curve_draft.remove(&fan.to_string());
                                     this.send(GuiCommand::SetFan {
-                                        fan,
+                                        fan: fan.clone(),
                                         config: FanConfig {
                                             mode: FanModeKind::Curve,
                                             curve: Some(cname.clone()),
@@ -1706,7 +1775,128 @@ impl ThermiteApp {
                                 }
                             }))
                             .child(pretty_curve_name(cname))
-                    })),
+                    }))
+                    // New curve: copies the current points under a fresh
+                    // name and switches this fan onto it.
+                    .child(
+                        div()
+                            .id(SharedString::new(format!("preset-new-{name}")))
+                            .px_3()
+                            .py_1p5()
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .rounded_md()
+                            .border_1()
+                            .bg(BG)
+                            .border_color(BORDER)
+                            .text_color(TEXT_MUTED)
+                            .hover(|this| this.bg(SURFACE_RAISED).text_color(TEXT))
+                            .on_click(cx.listener({
+                                let fan = fan.clone();
+                                let active_curve = active_curve.clone();
+                                let seed: Vec<CurvePoint> = if points.is_empty() {
+                                    self.config
+                                        .curves
+                                        .get("balanced")
+                                        .map(|c| c.points.clone())
+                                        .unwrap_or_default()
+                                } else {
+                                    points.to_vec()
+                                };
+                                move |this, _ev: &ClickEvent, _window, cx| {
+                                    let mut n = 1;
+                                    let new_name = loop {
+                                        let candidate = format!(
+                                            "custom{}",
+                                            if n == 1 {
+                                                String::new()
+                                            } else {
+                                                format!("-{n}")
+                                            }
+                                        );
+                                        if !this.config.curves.contains_key(&candidate) {
+                                            break candidate;
+                                        }
+                                        n += 1;
+                                    };
+                                    this.curve_draft.insert(fan.to_string(), seed.clone());
+                                    this.send(GuiCommand::PutCurve {
+                                        name: new_name.clone(),
+                                        points: seed.clone(),
+                                    });
+                                    this.send(GuiCommand::SetFan {
+                                        fan: fan.clone(),
+                                        config: FanConfig {
+                                            mode: FanModeKind::Curve,
+                                            curve: Some(new_name),
+                                            manual_duty_pct: None,
+                                        },
+                                    });
+                                    let _ = &active_curve;
+                                    cx.notify();
+                                }
+                            }))
+                            .child("+ New"),
+                    )
+                    // Delete the active curve (fans on it go back to auto).
+                    .when(!curves.is_empty(), |this| {
+                        let fan_for_del = fan.clone();
+                        let active_for_del = active_curve.clone();
+                        this.child(
+                            div()
+                                .id(SharedString::new(format!("preset-del-{name}")))
+                                .px_3()
+                                .py_1p5()
+                                .text_xs()
+                                .font_weight(FontWeight::MEDIUM)
+                                .rounded_md()
+                                .border_1()
+                                .border_color(BORDER)
+                                .bg(BG)
+                                .text_color(TEXT_FAINT)
+                                .hover(|this| this.text_color(ACCENT))
+                                .on_click(cx.listener({
+                                    let fan = fan_for_del.clone();
+                                    let curve = active_for_del.clone();
+                                    move |this, _ev: &ClickEvent, _window, cx| {
+                                        // Releasing every fan that uses the curve
+                                        // keeps the daemon-side reference check
+                                        // happy (delete is refused while in use).
+                                        let users: Vec<FanId> = this
+                                            .status
+                                            .as_ref()
+                                            .map(|s| {
+                                                s.control
+                                                    .fans
+                                                    .iter()
+                                                    .filter(|f| {
+                                                        f.config.curve.as_deref()
+                                                            == Some(curve.as_str())
+                                                    })
+                                                    .map(|f| f.id.clone())
+                                                    .collect()
+                                            })
+                                            .unwrap_or_default();
+                                        for u in users {
+                                            this.send(GuiCommand::SetFan {
+                                                fan: u,
+                                                config: FanConfig {
+                                                    mode: FanModeKind::Auto,
+                                                    curve: None,
+                                                    manual_duty_pct: None,
+                                                },
+                                            });
+                                        }
+                                        this.curve_draft.remove(&fan.to_string());
+                                        this.send(GuiCommand::DeleteCurve {
+                                            name: curve.clone(),
+                                        });
+                                        cx.notify();
+                                    }
+                                }))
+                                .child("✕ Delete"),
+                        )
+                    }),
             )
             .child(
                 div()
@@ -1720,88 +1910,129 @@ impl ThermiteApp {
                 v_flex()
                     .id(SharedString::new(format!("points-{name}")))
                     .gap_1()
-                    .children(points.iter().enumerate().map(|(i, p)| {
-                        h_flex()
-                            .gap_6()
-                            .items_center()
-                            .px_3()
-                            .py_1p5()
-                            .rounded_md()
-                            .bg(BG)
-                            .child(div().size(px(8.)).rounded_full().bg(ACCENT))
-                            // temperature cluster: value + its steppers
-                            .child(
-                                h_flex()
-                                    .gap_1()
-                                    .items_center()
-                                    .child(
-                                        div()
-                                            .w(px(48.))
-                                            .text_sm()
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .text_color(TEXT)
-                                            .child(format!("{:.0}°C", p.0)),
-                                    )
-                                    .child(self.stepper(format!("pt-t-{name}-{i}"), "−", {
-                                        let points = points.to_vec();
-                                        cx.listener(move |this, _ev: &ClickEvent, _window, _cx| {
-                                            this.adjust_point(fan, i, &points, -5.0, 0);
-                                        })
-                                    }))
-                                    .child(self.stepper(format!("pt-t+{name}-{i}"), "+", {
-                                        let points = points.to_vec();
-                                        cx.listener(move |this, _ev: &ClickEvent, _window, _cx| {
-                                            this.adjust_point(fan, i, &points, 5.0, 0);
-                                        })
-                                    })),
-                            )
-                            // duty cluster: value + its steppers
-                            .child(
-                                h_flex()
-                                    .gap_1()
-                                    .items_center()
-                                    .child(
-                                        div()
-                                            .w(px(44.))
-                                            .text_sm()
-                                            .text_color(TEXT_MUTED)
-                                            .child(format!("{}%", p.1)),
-                                    )
-                                    .child(self.stepper(format!("pt-d-{name}-{i}"), "−", {
-                                        let points = points.to_vec();
-                                        cx.listener(move |this, _ev: &ClickEvent, _window, _cx| {
-                                            this.adjust_point(fan, i, &points, 0.0, -5);
-                                        })
-                                    }))
-                                    .child(self.stepper(format!("pt-d+{name}-{i}"), "+", {
-                                        let points = points.to_vec();
-                                        cx.listener(move |this, _ev: &ClickEvent, _window, _cx| {
-                                            this.adjust_point(fan, i, &points, 0.0, 5);
-                                        })
-                                    })),
-                            )
-                            .child(div().flex_1())
-                            .when(points.len() > 1, |this| {
-                                this.child(
-                                    div()
-                                        .id(SharedString::new(format!("pt-del-{name}-{i}")))
-                                        .px_1()
-                                        .text_sm()
-                                        .text_color(TEXT_FAINT)
-                                        .hover(|this| this.text_color(ACCENT))
-                                        .on_click(cx.listener({
+                    .children({
+                        let fan = fan.clone();
+                        let name = name.clone();
+                        points.iter().enumerate().map(move |(i, p)| {
+                            h_flex()
+                                .gap_6()
+                                .items_center()
+                                .px_3()
+                                .py_1p5()
+                                .rounded_md()
+                                .bg(BG)
+                                .child(div().size(px(8.)).rounded_full().bg(ACCENT))
+                                // temperature cluster: value + its steppers
+                                .child(
+                                    h_flex()
+                                        .gap_1()
+                                        .items_center()
+                                        .child(
+                                            div()
+                                                .w(px(48.))
+                                                .text_sm()
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .text_color(TEXT)
+                                                .child(format!("{:.0}°C", p.0)),
+                                        )
+                                        .child(self.stepper(format!("pt-t-{name}-{i}"), "−", {
                                             let points = points.to_vec();
-                                            move |this, _ev: &ClickEvent, _window, cx| {
-                                                let mut pts = points.clone();
-                                                pts.remove(i);
-                                                this.commit_curve(fan, pts);
-                                                cx.notify();
-                                            }
+                                            cx.listener({
+                                                let fan = fan.clone();
+                                                move |this, _ev: &ClickEvent, _window, _cx| {
+                                                    this.adjust_point(
+                                                        fan.clone(),
+                                                        i,
+                                                        &points,
+                                                        -5.0,
+                                                        0,
+                                                    );
+                                                }
+                                            })
                                         }))
-                                        .child("✕"),
+                                        .child(self.stepper(format!("pt-t+{name}-{i}"), "+", {
+                                            let points = points.to_vec();
+                                            cx.listener({
+                                                let fan = fan.clone();
+                                                move |this, _ev: &ClickEvent, _window, _cx| {
+                                                    this.adjust_point(
+                                                        fan.clone(),
+                                                        i,
+                                                        &points,
+                                                        5.0,
+                                                        0,
+                                                    );
+                                                }
+                                            })
+                                        })),
                                 )
-                            })
-                    })),
+                                // duty cluster: value + its steppers
+                                .child(
+                                    h_flex()
+                                        .gap_1()
+                                        .items_center()
+                                        .child(
+                                            div()
+                                                .w(px(44.))
+                                                .text_sm()
+                                                .text_color(TEXT_MUTED)
+                                                .child(format!("{}%", p.1)),
+                                        )
+                                        .child(self.stepper(format!("pt-d-{name}-{i}"), "−", {
+                                            let points = points.to_vec();
+                                            cx.listener({
+                                                let fan = fan.clone();
+                                                move |this, _ev: &ClickEvent, _window, _cx| {
+                                                    this.adjust_point(
+                                                        fan.clone(),
+                                                        i,
+                                                        &points,
+                                                        0.0,
+                                                        -5,
+                                                    );
+                                                }
+                                            })
+                                        }))
+                                        .child(self.stepper(format!("pt-d+{name}-{i}"), "+", {
+                                            let points = points.to_vec();
+                                            cx.listener({
+                                                let fan = fan.clone();
+                                                move |this, _ev: &ClickEvent, _window, _cx| {
+                                                    this.adjust_point(
+                                                        fan.clone(),
+                                                        i,
+                                                        &points,
+                                                        0.0,
+                                                        5,
+                                                    );
+                                                }
+                                            })
+                                        })),
+                                )
+                                .child(div().flex_1())
+                                .when(points.len() > 1, |this| {
+                                    this.child(
+                                        div()
+                                            .id(SharedString::new(format!("pt-del-{name}-{i}")))
+                                            .px_1()
+                                            .text_sm()
+                                            .text_color(TEXT_FAINT)
+                                            .hover(|this| this.text_color(ACCENT))
+                                            .on_click(cx.listener({
+                                                let points = points.to_vec();
+                                                let fan = fan.clone();
+                                                move |this, _ev: &ClickEvent, _window, cx| {
+                                                    let mut pts = points.clone();
+                                                    pts.remove(i);
+                                                    this.commit_curve(&fan, pts);
+                                                    cx.notify();
+                                                }
+                                            }))
+                                            .child("✕"),
+                                    )
+                                })
+                        })
+                    }),
             )
             .child(
                 div()
@@ -1830,7 +2061,7 @@ impl ThermiteApp {
                                 last.0 + 10.0
                             };
                             pts.push(CurvePoint(new_temp, last.1));
-                            this.commit_curve(fan, pts);
+                            this.commit_curve(&fan, pts);
                             cx.notify();
                         }
                     }))
@@ -1872,7 +2103,7 @@ impl ThermiteApp {
         };
         p.0 = (p.0 + dt).clamp(lo, hi);
         p.1 = (i16::from(p.1) + dd).clamp(0, 100) as u8;
-        self.commit_curve(fan, pts);
+        self.commit_curve(&fan, pts);
     }
 
     fn render_fans(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -1922,7 +2153,11 @@ impl ThermiteApp {
                         ),
                 )
             })
-            .children(FanId::all().map(|fan| self.render_fan_card(fan, cx)))
+            .children(
+                self.fan_ids()
+                    .iter()
+                    .map(|fan| self.render_fan_card(fan, cx)),
+            )
     }
 
     fn render_profiles(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -1939,10 +2174,7 @@ impl ThermiteApp {
             .selected_profile
             .clone()
             .or_else(|| available.first().cloned());
-        let selected_meta = selected
-            .as_deref()
-            .and_then(thermite_core::PlatformProfile::parse)
-            .map(|p| profile_meta(&p));
+        let selected_meta = selected.as_deref().map(profile_meta);
 
         // Left: profile list. Right: detail panel.
         v_flex()
@@ -2050,14 +2282,8 @@ impl ThermiteApp {
         manages: bool,
         cx: &Context<Self>,
     ) -> Stateful<Div> {
-        let meta = thermite_core::PlatformProfile::parse(name).map(|p| profile_meta(&p));
-        let (icon, title, desc) = meta.map(|(i, t, d, _)| (i, t, d)).unwrap_or_else(|| {
-            (
-                icons::SETTINGS,
-                name.to_string(),
-                "Firmware-defined profile.".to_string(),
-            )
-        });
+        let meta = profile_meta(name);
+        let (icon, title, desc, _) = meta;
 
         div()
             .id(SharedString::new(format!("profile-row-{name}")))
@@ -2503,44 +2729,58 @@ impl ThermiteApp {
 
 /// Verified firmware semantics for each profile (see docs/HARDWARE.md).
 /// Returns (icon, title, description, firmware-mode note).
-fn profile_meta(p: &thermite_core::PlatformProfile) -> (&'static str, String, String, String) {
-    match p {
-        thermite_core::PlatformProfile::LowPower => (
+fn temp_source_str(source: &TempSource) -> String {
+    match source {
+        TempSource::Cpu => "CPU temperature".to_string(),
+        TempSource::Gpu => "GPU temperature".to_string(),
+        TempSource::Named(n) => format!("\"{n}\" sensor"),
+    }
+}
+
+fn profile_meta(name: &str) -> (&'static str, String, String, String) {
+    match name {
+        "low-power" => (
             icons::LEAF,
             "Low Power".to_string(),
             "Lowest power draw (Acer Eco mode). Fans stay quiet; best on battery.".to_string(),
             "Eco — the firmware's power-sipping mode".to_string(),
         ),
-        thermite_core::PlatformProfile::Quiet => (
+        "quiet" => (
             icons::MOON,
             "Quiet".to_string(),
             "Firmware quiet bias — lower fan baseline for light desktop workloads.".to_string(),
             "Quiet (0x00)".to_string(),
         ),
-        thermite_core::PlatformProfile::Balanced => (
+        "balanced" => (
             icons::SCALE,
             "Balanced".to_string(),
             "Factory default balance of thermals, noise and performance.".to_string(),
             "Balanced (0x01)".to_string(),
         ),
-        thermite_core::PlatformProfile::BalancedPerformance => (
+        "balanced-performance" => (
             icons::TRENDING_UP,
             "Balanced Performance".to_string(),
             "Acer's high-performance mode — the strongest profile this BIOS honors.".to_string(),
             "Performance (0x04) — the real max on this firmware".to_string(),
         ),
-        thermite_core::PlatformProfile::Performance => (
+        "performance" => (
             icons::ZAP,
             "Performance".to_string(),
             "Requests Acer Turbo mode. This BIOS rejects it — the selection silently reverts."
                 .to_string(),
             "Turbo (0x05) — refused by this firmware".to_string(),
         ),
-        thermite_core::PlatformProfile::Turbo => (
+        "turbo" => (
             icons::ZAP,
             "Turbo".to_string(),
             "Rejected by this firmware; not offered.".to_string(),
-            "Turbo (0x05)".to_string(),
+            "Turbo (0x05) — refused by this firmware".to_string(),
+        ),
+        other => (
+            icons::SETTINGS,
+            pretty_curve_name(other),
+            "Firmware-defined profile.".to_string(),
+            String::new(),
         ),
     }
 }
@@ -2700,6 +2940,7 @@ fn spawn_command_thread(
                 GuiCommand::SetFan { fan, config } => Request::SetFanConfig { fan, config },
                 GuiCommand::SetProfile { profile } => Request::SetPlatformProfile { profile },
                 GuiCommand::PutCurve { name, points } => Request::PutCurve { name, points },
+                GuiCommand::DeleteCurve { name } => Request::DeleteCurve { name },
             };
             let outcome = match c.call(request) {
                 Ok(Response::Ok) => Ok(()),

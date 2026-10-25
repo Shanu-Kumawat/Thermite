@@ -1228,10 +1228,7 @@ mod tests {
             let mut g = shared.lock().unwrap();
             g.config.curves.insert(
                 "balanced".into(),
-                CurveDef::from_points(vec![
-                    CurvePoint(40.0, 30),
-                    CurvePoint(95.0, 30),
-                ]),
+                CurveDef::from_points(vec![CurvePoint(40.0, 30), CurvePoint(95.0, 30)]),
             );
             g.config_gen += 1;
         }

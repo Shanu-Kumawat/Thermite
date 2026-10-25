@@ -163,7 +163,8 @@ impl Telemetry {
     /// Peak CPU temperature across CPU-class sensors (falls back to board
     /// zones).
     pub fn cpu_temp_c(&self) -> Option<f32> {
-        self.temp_by_class(TempClass::Cpu).or_else(|| self.board_max())
+        self.temp_by_class(TempClass::Cpu)
+            .or_else(|| self.board_max())
     }
 
     /// Peak GPU temperature (NVML preferred, then GPU-class sensors, then
@@ -182,7 +183,9 @@ impl Telemetry {
             .iter()
             .filter(|t| t.class == class)
             .map(|t| t.temp_c)
-            .fold(None, |acc: Option<f32>, t| Some(acc.map_or(t, |a| a.max(t))))
+            .fold(None, |acc: Option<f32>, t| {
+                Some(acc.map_or(t, |a| a.max(t)))
+            })
     }
 
     /// Resolve a fan's driving temperature per its declared [`TempSource`].
@@ -287,7 +290,10 @@ mod tests {
     fn fan_id_display_and_serde() {
         let id = FanId::new("intake");
         assert_eq!(id.to_string(), "intake");
-        assert_eq!(serde_json::to_string(&FanId::new("cpu")).unwrap(), "\"cpu\"");
+        assert_eq!(
+            serde_json::to_string(&FanId::new("cpu")).unwrap(),
+            "\"cpu\""
+        );
         assert_eq!(
             serde_json::from_str::<FanId>("\"gpu\"").unwrap(),
             FanId::new("gpu")
@@ -340,10 +346,7 @@ mod tests {
             t.temp_for(&TempSource::Named("Composite".into())),
             Some(67.0)
         );
-        assert_eq!(
-            t.fan(&FanId::new("cpu")).and_then(|f| f.rpm),
-            Some(2400)
-        );
+        assert_eq!(t.fan(&FanId::new("cpu")).and_then(|f| f.rpm), Some(2400));
         assert!(t.fan(&FanId::new("gpu")).is_none());
     }
 
