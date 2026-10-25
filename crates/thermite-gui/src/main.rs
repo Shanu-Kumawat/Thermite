@@ -5,14 +5,17 @@
 //! one for request/response (command thread) — this avoids async plumbing
 //! around the blocking IPC client.
 
-use std::collections::VecDeque;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::mpsc::{self, Sender};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use gpui_kit::component::chart::AreaChart;
-use gpui_kit::component::{h_flex, v_flex, Icon, Theme, ThemeMode, TitleBar};
+use gpui_kit::component::scroll::ScrollableElement;
+use gpui_kit::component::{Icon, Theme, ThemeMode, TitleBar, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use thermite_core::config::{Config, FanConfig, FanModeKind};
@@ -35,6 +38,10 @@ mod icons {
     pub const THERMOMETER: &str = include_str!("../assets/icons/thermometer.svg");
     pub const LIST_FILTER: &str = include_str!("../assets/icons/list-filter.svg");
     pub const FLAME: &str = include_str!("../assets/icons/flame.svg");
+    pub const GAUGE: &str = include_str!("../assets/icons/gauge.svg");
+    pub const SETTINGS: &str = include_str!("../assets/icons/settings.svg");
+    pub const INFO: &str = include_str!("../assets/icons/info.svg");
+    pub const MONITOR: &str = include_str!("../assets/icons/monitor.svg");
 }
 
 /// Render a bundled Lucide SVG at a given size and color.
@@ -60,9 +67,8 @@ impl MachineInfo {
             .ok()
             .and_then(|s| {
                 s.lines().find_map(|l| {
-                    l.strip_prefix("PRETTY_NAME=").map(|v| {
-                        v.trim_matches('"').trim().to_string()
-                    })
+                    l.strip_prefix("PRETTY_NAME=")
+                        .map(|v| v.trim_matches('"').trim().to_string())
                 })
             })
             .unwrap_or_else(|| "Linux".into());
@@ -76,7 +82,7 @@ const MAX_SAMPLES: usize = 240;
 /// Monochrome design tokens: deep black background, charcoal surfaces,
 /// subtle gray borders, white typography, restrained red accent.
 mod ui {
-    use gpui_kit::{hsla, Hsla};
+    use gpui_kit::{Hsla, hsla};
 
     /// App background.
     pub const BG: Hsla = hsla(0., 0., 0.04, 1.);
@@ -101,7 +107,9 @@ mod ui {
     /// Soft warning (battery, post-resume grace).
     pub const WARN: Hsla = hsla(0.09, 0.85, 0.62, 1.);
 }
-use ui::{ACCENT, ACCENT_DIM, BG, BORDER, OK, SURFACE, SURFACE_RAISED, TEXT, TEXT_FAINT, TEXT_MUTED, WARN};
+use ui::{
+    ACCENT, ACCENT_DIM, BG, BORDER, OK, SURFACE, SURFACE_RAISED, TEXT, TEXT_FAINT, TEXT_MUTED, WARN,
+};
 
 /// One telemetry sample for the charts.
 #[derive(Clone)]
@@ -147,7 +155,6 @@ enum Nav {
     #[default]
     Dashboard,
     Fans,
-    Curves,
     Profiles,
 }
 
@@ -156,7 +163,6 @@ impl Nav {
         match self {
             Nav::Dashboard => "Dashboard",
             Nav::Fans => "Fans",
-            Nav::Curves => "Curves",
             Nav::Profiles => "Profiles",
         }
     }
@@ -164,12 +170,11 @@ impl Nav {
         match self {
             Nav::Dashboard => icons::HOUSE,
             Nav::Fans => icons::FAN,
-            Nav::Curves => icons::CHART_LINE,
             Nav::Profiles => icons::LAYOUT_GRID,
         }
     }
-    fn all() -> [Nav; 4] {
-        [Nav::Dashboard, Nav::Fans, Nav::Curves, Nav::Profiles]
+    fn all() -> [Nav; 3] {
+        [Nav::Dashboard, Nav::Fans, Nav::Profiles]
     }
 }
 
@@ -186,8 +191,14 @@ pub struct ThermiteApp {
     alerts: VecDeque<Alert>,
     toast: Option<(String, bool)>, // (message, is_error)
     cmd_tx: Option<Sender<GuiCommand>>,
-    selected_curve: String,
-    curve_edit: Option<Vec<CurvePoint>>,
+    /// Per-fan working copy of curve points while editing (fan -> points).
+    curve_draft: BTreeMap<String, Vec<CurvePoint>>,
+    /// Per-fan duty preview while the manual slider is being dragged.
+    manual_draft: BTreeMap<String, u8>,
+    /// Curve point currently being dragged: (fan, point index).
+    drag_point: Option<(String, usize)>,
+    /// Fan whose duty slider is being dragged.
+    slider_drag: Option<String>,
 }
 
 impl ThermiteApp {
@@ -230,8 +241,10 @@ impl ThermiteApp {
             alerts: VecDeque::new(),
             toast: None,
             cmd_tx: Some(cmd_tx),
-            selected_curve: "balanced".to_string(),
-            curve_edit: None,
+            curve_draft: BTreeMap::new(),
+            manual_draft: BTreeMap::new(),
+            drag_point: None,
+            slider_drag: None,
         }
     }
 
@@ -276,16 +289,8 @@ impl ThermiteApp {
             }
             IpcEvent::Config(config) => {
                 self.config = *config;
-                if !self.config.curves.contains_key(&self.selected_curve) {
-                    self.selected_curve = self
-                        .config
-                        .curves
-                        .keys()
-                        .next()
-                        .cloned()
-                        .unwrap_or_default();
-                }
-                self.curve_edit = None;
+                // Committed curves arrived; local drafts are superseded.
+                self.curve_draft.clear();
             }
             IpcEvent::CommandDone(Ok(())) => {
                 self.toast = Some(("applied".to_string(), false));
@@ -321,58 +326,52 @@ impl ThermiteApp {
         }
     }
 
-    // ---------- curve editing ----------
+    // ---------- fan page helpers ----------
 
-    fn editing_points(&self) -> Option<Vec<CurvePoint>> {
-        self.curve_edit.clone().or_else(|| {
-            self.config
-                .curves
-                .get(&self.selected_curve)
-                .map(|c| c.points.clone())
-        })
+    /// The curve a fan currently follows (config-selected, or the default).
+    fn fan_curve_name(&self, fan: FanId) -> String {
+        self.fan_state(fan)
+            .and_then(|r| r.config.curve.clone())
+            .filter(|c| self.config.curves.contains_key(c))
+            .unwrap_or_else(|| self.default_curve_name())
     }
 
-    fn adjust_curve_point(&mut self, index: usize, dt: f32, dd: i16) {
-        if let Some(mut points) = self.editing_points()
-            && let Some(p) = points.get_mut(index)
-        {
-            p.0 = (p.0 + dt).clamp(20.0, 110.0);
-            p.1 = (i16::from(p.1) + dd).clamp(0, 100) as u8;
-            self.curve_edit = Some(points);
+    /// The points shown in a fan's curve editor: the local draft while
+    /// editing, otherwise the committed curve.
+    fn fan_points(&self, fan: FanId) -> Vec<CurvePoint> {
+        if let Some(draft) = self.curve_draft.get(&fan.to_string()) {
+            return draft.clone();
         }
+        self.config
+            .curves
+            .get(&self.fan_curve_name(fan))
+            .map(|c| c.points.clone())
+            .unwrap_or_default()
     }
 
-    fn delete_curve_point(&mut self, index: usize) {
-        if let Some(mut points) = self.editing_points()
-            && points.len() > 1
-        {
-            points.remove(index);
-            self.curve_edit = Some(points);
+    /// The duty shown for a fan in manual mode: slider preview or committed.
+    fn fan_duty(&self, fan: FanId) -> u8 {
+        if let Some(d) = self.manual_draft.get(&fan.to_string()) {
+            return *d;
         }
+        self.fan_state(fan)
+            .and_then(|r| r.config.manual_duty_pct)
+            .unwrap_or(40)
     }
 
-    fn add_curve_point(&mut self) {
-        if let Some(mut points) = self.editing_points() {
-            let next = (points.last().map(|p| p.0).unwrap_or(40.0) + 10.0).min(105.0);
-            let duty = points.last().map(|p| p.1).unwrap_or(50);
-            points.push(CurvePoint(next, duty));
-            self.curve_edit = Some(points);
-        }
-    }
-
-    fn save_curve(&mut self) {
-        let name = self.selected_curve.clone();
-        let Some(points) = self.curve_edit.clone() else {
-            return;
-        };
-        if CurveDef::validated(points.clone()).is_err() {
-            self.toast = Some((
-                "curve invalid: temps must be strictly increasing, duties 0-100".to_string(),
-                true,
-            ));
+    /// Validate and commit a curve edit: preview locally, push to the
+    /// daemon (which persists it); invalid curves are rejected silently —
+    /// the editor falls back to the last committed state.
+    fn commit_curve(&mut self, fan: FanId, points: Vec<CurvePoint>) {
+        if points.is_empty() || CurveDef::validated(points.clone()).is_err() {
+            self.curve_draft.remove(&fan.to_string());
             return;
         }
-        self.send(GuiCommand::PutCurve { name, points });
+        self.curve_draft.insert(fan.to_string(), points.clone());
+        self.send(GuiCommand::PutCurve {
+            name: self.fan_curve_name(fan),
+            points,
+        });
     }
 
     // ---------- rendering ----------
@@ -414,26 +413,20 @@ impl ThermiteApp {
                     .py_2()
                     .rounded_md()
                     .text_sm()
-                    .when(active, |this| {
-                        this.bg(ACCENT_DIM)
-                            .text_color(TEXT)
-                    })
+                    .when(active, |this| this.bg(ACCENT_DIM).text_color(TEXT))
                     .when(!active, |this| {
                         this.text_color(TEXT_MUTED)
-                            .hover(|this| {
-                                this.bg(SURFACE_RAISED)
-                                    .text_color(TEXT)
-                            })
+                            .hover(|this| this.bg(SURFACE_RAISED).text_color(TEXT))
                     })
                     .on_click(cx.listener(move |this, _ev: &ClickEvent, _window, cx| {
                         this.nav = nav;
                         cx.notify();
                     }))
-                    .child(svg_icon(nav.icon(), if active {
-                        TEXT
-                    } else {
-                        TEXT_MUTED
-                    }, 16.))
+                    .child(svg_icon(
+                        nav.icon(),
+                        if active { TEXT } else { TEXT_MUTED },
+                        16.,
+                    ))
                     .child(label.to_string())
             }))
             .child(
@@ -447,31 +440,18 @@ impl ThermiteApp {
                     .px_3()
                     .py_2()
                     .rounded_md()
-                    .when(self.connected, |this| {
-                        this.bg(SURFACE)
-                            .text_color(OK)
-                    })
-                    .when(!self.connected, |this| {
-                        this.bg(SURFACE)
-                            .text_color(ACCENT)
-                    })
-                    .child(
-                        div()
-                            .size(px(8.))
-                            .rounded_full()
-                            .bg(if self.connected {
-                                OK
-                            } else {
-                                ACCENT
-                            }),
-                    )
-                    .child(
-                        div().text_sm().child(if self.connected {
-                            "daemon online".to_string()
-                        } else {
-                            "daemon offline".to_string()
-                        }),
-                    ),
+                    .when(self.connected, |this| this.bg(SURFACE).text_color(OK))
+                    .when(!self.connected, |this| this.bg(SURFACE).text_color(ACCENT))
+                    .child(div().size(px(8.)).rounded_full().bg(if self.connected {
+                        OK
+                    } else {
+                        ACCENT
+                    }))
+                    .child(div().text_sm().child(if self.connected {
+                        "daemon online".to_string()
+                    } else {
+                        "daemon offline".to_string()
+                    })),
             )
     }
 }
@@ -600,10 +580,12 @@ impl ThermiteApp {
                             TEXT,
                             clickable: true
                         )
-                        .on_click(cx.listener(|this, _ev: &ClickEvent, _window, cx| {
-                            this.nav = Nav::Profiles;
-                            cx.notify();
-                        })),
+                        .on_click(cx.listener(
+                            |this, _ev: &ClickEvent, _window, cx| {
+                                this.nav = Nav::Profiles;
+                                cx.notify();
+                            },
+                        )),
                     )
                     .child(status_chip!(
                         cx,
@@ -698,12 +680,7 @@ impl ThermiteApp {
                                     .text_color(value_color)
                                     .child(format!("{last:.0}")),
                             )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(TEXT_MUTED)
-                                    .child(unit),
-                            ),
+                            .child(div().text_sm().text_color(TEXT_MUTED).child(unit)),
                     ),
             )
             .child(
@@ -747,8 +724,7 @@ impl ThermiteApp {
                             .pb(px(18.))
                             .w(px(46.))
                             .children((0..ticks.max(2)).map(|i| {
-                                let v =
-                                    domain.1 - (domain.1 - domain.0) * i as f64 / intervals;
+                                let v = domain.1 - (domain.1 - domain.0) * i as f64 / intervals;
                                 div()
                                     .text_size(px(10.))
                                     .text_right()
@@ -835,9 +811,11 @@ impl ThermiteApp {
                     .child(div().w(px(120.)).child("Source"))
                     .child(div().w(px(80.)).text_right().child("Temp")),
             )
-            .children(temps.iter().map(|t| {
-                Self::sensor_row(&t.label, temp_class_str(t.class), t.temp_c)
-            }))
+            .children(
+                temps
+                    .iter()
+                    .map(|t| Self::sensor_row(&t.label, temp_class_str(t.class), t.temp_c)),
+            )
     }
 
     fn render_dashboard(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -943,201 +921,891 @@ impl ThermiteApp {
     }
 
     fn render_fan_card(&self, fan: FanId, cx: &Context<Self>) -> impl IntoElement {
+        let name = fan.to_string();
         let rt = self.fan_state(fan);
         let hw = self.status.as_ref().and_then(|s| s.telemetry.fan(fan));
         let mode = rt.map(|r| r.config.mode).unwrap_or_default();
-        let manual_duty = rt
-            .and_then(|r| r.config.manual_duty_pct)
-            .unwrap_or(40)
-            .clamp(0, 100);
-        let curve_name = rt
-            .and_then(|r| r.config.curve.clone())
-            .unwrap_or_else(|| "balanced".to_string());
-        let fan_label = fan.to_string();
+        let hw_rpm = hw.and_then(|h| h.rpm);
+        let hw_label = hw.and_then(|h| h.hw_mode).map(hw_mode_str).unwrap_or("—");
+        let temp = match fan {
+            FanId::Cpu => self.status.as_ref().and_then(|s| s.telemetry.cpu_temp_c()),
+            FanId::Gpu => self.status.as_ref().and_then(|s| s.telemetry.gpu_temp_c()),
+        }
+        .unwrap_or(0.0);
+        let (title, sub) = match fan {
+            FanId::Cpu => ("CPU Fan", "Controls the left fan (CPU)"),
+            FanId::Gpu => ("GPU Fan", "Controls the right fan (GPU)"),
+        };
+
+        let curve_points = self.fan_points(fan);
+        let curve_duty_now = CurveDef::from_points(curve_points.clone()).duty_at(temp);
+        let (target_speed, target_rpm) = match mode {
+            FanModeKind::Auto => (
+                "Auto".to_string(),
+                hw_rpm
+                    .map(|r| format!("~{r} rpm"))
+                    .unwrap_or_else(|| "—".into()),
+            ),
+            FanModeKind::Manual => {
+                let duty = self.fan_duty(fan);
+                (format!("{duty}%"), format!("~{} rpm", u32::from(duty) * 80))
+            }
+            FanModeKind::Curve => (
+                format!("{curve_duty_now}%"),
+                format!("~{} rpm", u32::from(curve_duty_now) * 80),
+            ),
+        };
+        let mode_label = match mode {
+            FanModeKind::Auto => "Auto",
+            FanModeKind::Manual => "Manual",
+            FanModeKind::Curve => "Curve",
+        };
+
+        let curve_mode = mode == FanModeKind::Curve;
+
+        // Content row: left control column, plus mode-specific right side.
+        let mut content = h_flex().gap_4().items_stretch().child(
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap_3()
+                .child(self.render_mode_buttons(fan, mode, cx))
+                .child(match mode {
+                    FanModeKind::Auto => self.render_auto_info(),
+                    FanModeKind::Manual => self.render_manual_control(fan, cx),
+                    FanModeKind::Curve => self.render_curve_graph(fan, &curve_points, temp, cx),
+                }),
+        );
+
+        if curve_mode {
+            content = content.child(self.render_curve_panel(fan, &curve_points, cx));
+            content = content.child(self.render_fan_stats(
+                fan,
+                temp,
+                target_speed,
+                target_rpm,
+                mode_label,
+                true,
+            ));
+        } else {
+            let (value_color, line_color) = match fan {
+                FanId::Cpu => (ACCENT, ACCENT.opacity(0.9)),
+                FanId::Gpu => (TEXT, TEXT.opacity(0.8)),
+            };
+            let chart_id = match fan {
+                FanId::Cpu => "rpm-chart-cpu",
+                FanId::Gpu => "rpm-chart-gpu",
+            };
+            content = content.child(div().w(px(380.)).flex_none().child(self.render_metric_card(
+                chart_id,
+                &format!(
+                    "Fan speed ({})",
+                    if fan == FanId::Cpu { "CPU" } else { "GPU" }
+                ),
+                icons::CHART_LINE,
+                TEXT_MUTED,
+                value_color,
+                line_color,
+                "rpm",
+                &self.samples.iter().cloned().collect::<Vec<Sample>>(),
+                move |d: &Sample| match fan {
+                    FanId::Cpu => d.cpu_rpm,
+                    FanId::Gpu => d.gpu_rpm,
+                },
+                (0.0, 8000.0),
+                5,
+                cx,
+            )));
+            content = content.child(
+                h_flex().gap_3().children(
+                    [
+                        (icons::THERMOMETER, "Current temp", format!("{temp:.0}°C")),
+                        (icons::FAN, "Current speed", target_speed),
+                        (icons::GAUGE, "Target rpm", target_rpm),
+                        (icons::SETTINGS, "Control mode", mode_label.to_string()),
+                    ]
+                    .map(|(icon, label, value)| self.stat_tile(icon, label, value).flex_1()),
+                ),
+            );
+        }
 
         v_flex()
-            .flex_1()
-            .gap_3()
+            .id(SharedString::new(format!("fan-card-{name}")))
             .border_1()
             .border_color(BORDER)
-            .rounded_md()
-            .p_4()
+            .rounded_lg()
+            .bg(SURFACE)
+            .p_5()
+            .gap_4()
+            // Header
             .child(
                 h_flex()
                     .justify_between()
-                    .child(div().text_base().child(format!("{fan_label} fan")))
+                    .items_start()
                     .child(
                         h_flex()
                             .gap_3()
+                            .items_center()
+                            .child(match fan {
+                                FanId::Cpu => {
+                                    svg_icon(icons::SETTINGS, ACCENT, 20.).into_any_element()
+                                }
+                                FanId::Gpu => {
+                                    svg_icon(icons::MONITOR, ACCENT, 20.).into_any_element()
+                                }
+                            })
                             .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(TEXT_MUTED)
-                                    .child(format!(
-                                        "{} rpm",
-                                        hw.and_then(|h| h.rpm)
-                                            .map(|r| r.to_string())
-                                            .unwrap_or_else(|| "—".into())
-                                    )),
+                                v_flex()
+                                    .gap_0p5()
+                                    .child(
+                                        div()
+                                            .text_base()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(TEXT)
+                                            .child(title),
+                                    )
+                                    .child(div().text_xs().text_color(TEXT_MUTED).child(sub)),
+                            ),
+                    )
+                    .child(
+                        v_flex()
+                            .items_end()
+                            .gap_0p5()
+                            .child(
+                                h_flex()
+                                    .items_baseline()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .text_2xl()
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(TEXT)
+                                            .child(
+                                                hw_rpm
+                                                    .map(|r| r.to_string())
+                                                    .unwrap_or_else(|| "—".into()),
+                                            ),
+                                    )
+                                    .child(div().text_sm().text_color(TEXT_MUTED).child("rpm")),
                             )
                             .child(
                                 div()
-                                    .text_sm()
+                                    .text_xs()
                                     .text_color(TEXT_MUTED)
-                                    .child(format!(
-                                        "hw {}",
-                                        hw.and_then(|h| h.hw_mode).map(hw_mode_str).unwrap_or("—")
-                                    )),
+                                    .child(format!("Hardware: {hw_label}")),
                             ),
                     ),
             )
+            .child(content)
+    }
+
+    /// Segmented Auto / Manual / Curve mode selector.
+    fn render_mode_buttons(
+        &self,
+        fan: FanId,
+        mode: FanModeKind,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        h_flex().gap_2().children(
+            [
+                (FanModeKind::Auto, "Auto"),
+                (FanModeKind::Manual, "Manual"),
+                (FanModeKind::Curve, "Curve"),
+            ]
+            .map(|(kind, label)| {
+                let active = mode == kind;
+                div()
+                    .id(SharedString::new(format!("mode-{}-{label}", fan)))
+                    .px_5()
+                    .py_2()
+                    .text_sm()
+                    .font_weight(FontWeight::MEDIUM)
+                    .rounded_md()
+                    .border_1()
+                    .when(active, |this| {
+                        this.bg(ACCENT).border_color(ACCENT).text_color(TEXT)
+                    })
+                    .when(!active, |this| {
+                        this.bg(BG)
+                            .border_color(BORDER)
+                            .text_color(TEXT_MUTED)
+                            .hover(|this| this.bg(SURFACE_RAISED).text_color(TEXT))
+                    })
+                    .on_click(cx.listener(move |this, _ev: &ClickEvent, _window, cx| {
+                        let config = match kind {
+                            FanModeKind::Auto => FanConfig {
+                                mode: FanModeKind::Auto,
+                                curve: None,
+                                manual_duty_pct: None,
+                            },
+                            FanModeKind::Manual => FanConfig {
+                                mode: FanModeKind::Manual,
+                                curve: None,
+                                manual_duty_pct: Some(this.fan_duty(fan)),
+                            },
+                            FanModeKind::Curve => FanConfig {
+                                mode: FanModeKind::Curve,
+                                curve: Some(this.fan_curve_name(fan)),
+                                manual_duty_pct: None,
+                            },
+                        };
+                        this.manual_draft.remove(&fan.to_string());
+                        this.send(GuiCommand::SetFan { fan, config });
+                        cx.notify();
+                    }))
+                    .child(label)
+            }),
+        )
+    }
+
+    /// Explanatory box shown in Auto mode.
+    fn render_auto_info(&self) -> Div {
+        div()
+            .flex_1()
+            .rounded_md()
+            .bg(BG)
+            .border_1()
+            .border_color(BORDER)
+            .p_4()
             .child(
-                h_flex().gap_2().children(
-                    [
-                        (FanModeKind::Auto, "Auto", mode == FanModeKind::Auto),
-                        (FanModeKind::Manual, "Manual", mode == FanModeKind::Manual),
-                        (FanModeKind::Curve, "Curve", mode == FanModeKind::Curve),
-                    ]
-                    .map(|(kind, label, active)| {
+                h_flex()
+                    .gap_2()
+                    .items_start()
+                    .child(svg_icon(icons::INFO, TEXT_MUTED, 14.))
+                    .child(
+                        div().text_sm().text_color(TEXT_MUTED).child(
+                            "In auto mode, fan speed is controlled by the embedded controller based on temperature and power limits.",
+                        ),
+                    ),
+            )
+    }
+
+    /// Manual-mode control: duty label + big percentage + slider.
+    fn render_manual_control(&self, fan: FanId, cx: &Context<Self>) -> Div {
+        let duty = self.fan_duty(fan);
+        v_flex()
+            .flex_1()
+            .gap_4()
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_end()
+                    .child(
                         div()
-                            .id(SharedString::new(format!("{fan_label}-mode-{label}")))
-                            .px_4()
-                            .py_1()
                             .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(TEXT)
+                            .child("Fan speed (duty)"),
+                    )
+                    .child(
+                        div()
+                            .text_xl()
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(ACCENT)
+                            .child(format!("{duty}%")),
+                    ),
+            )
+            .child(self.render_duty_slider(fan, duty, cx))
+    }
+
+    /// Custom duty slider: red fill, draggable thumb; commits on release.
+    fn render_duty_slider(&self, fan: FanId, duty: u8, cx: &Context<Self>) -> Div {
+        let name = fan.to_string();
+        let bounds_cell: Rc<RefCell<Option<Bounds<Pixels>>>> = Rc::default();
+        let frac = f32::from(duty) / 100.0;
+
+        let track = div()
+            .relative()
+            .flex_1()
+            .h(px(6.))
+            .rounded_full()
+            .bg(SURFACE_RAISED)
+            // invisible canvas: captures the track bounds for event math
+            .child(
+                canvas(
+                    {
+                        let bounds_cell = Rc::clone(&bounds_cell);
+                        move |bounds: Bounds<Pixels>, _: &mut Window, _: &mut App| {
+                            *bounds_cell.borrow_mut() = Some(bounds);
+                        }
+                    },
+                    |_: Bounds<Pixels>, _: (), _: &mut Window, _: &mut App| {},
+                )
+                .absolute()
+                .inset_0(),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .top_0()
+                    .bottom_0()
+                    .w(relative(frac))
+                    .rounded_full()
+                    .bg(ACCENT),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top(px(-4.))
+                    .left(relative(frac))
+                    .ml(px(-7.))
+                    .size(px(14.))
+                    .rounded_full()
+                    .bg(ACCENT)
+                    .border_2()
+                    .border_color(BG),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .inset(px(-10.))
+                    .cursor_pointer()
+                    .on_mouse_down(MouseButton::Left, {
+                        let bounds_cell = Rc::clone(&bounds_cell);
+                        let name = name.clone();
+                        cx.listener(move |this, ev: &MouseDownEvent, _window, cx| {
+                            if let Some(duty) =
+                                this.slider_duty_at(&name, *bounds_cell.borrow(), ev.position.x)
+                            {
+                                this.slider_drag = Some(name.clone());
+                                this.manual_draft.insert(name.clone(), duty);
+                                cx.notify();
+                            }
+                        })
+                    })
+                    .on_mouse_move({
+                        let bounds_cell = Rc::clone(&bounds_cell);
+                        let name = name.clone();
+                        cx.listener(move |this, ev: &MouseMoveEvent, _window, cx| {
+                            if this.slider_drag.as_deref() != Some(name.as_str())
+                                || ev.pressed_button != Some(MouseButton::Left)
+                            {
+                                return;
+                            }
+                            if let Some(duty) =
+                                this.slider_duty_at(&name, *bounds_cell.borrow(), ev.position.x)
+                            {
+                                this.manual_draft.insert(name.clone(), duty);
+                                cx.notify();
+                            }
+                        })
+                    })
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev: &MouseUpEvent, _window, cx| {
+                            if this.slider_drag.as_deref() != Some(name.as_str()) {
+                                return;
+                            }
+                            this.slider_drag = None;
+                            let duty = this.fan_duty(fan);
+                            this.manual_draft.remove(&fan.to_string());
+                            this.send(GuiCommand::SetFan {
+                                fan,
+                                config: FanConfig {
+                                    mode: FanModeKind::Manual,
+                                    curve: None,
+                                    manual_duty_pct: Some(duty),
+                                },
+                            });
+                            cx.notify();
+                        }),
+                    ),
+            );
+
+        h_flex()
+            .gap_3()
+            .items_center()
+            .child(div().text_xs().text_color(TEXT_FAINT).child("0%"))
+            .child(track)
+            .child(div().text_xs().text_color(TEXT_FAINT).child("100%"))
+    }
+
+    /// Map a slider pointer x to a duty percentage using the stashed
+    /// track bounds.
+    fn slider_duty_at(&self, _fan: &str, bounds: Option<Bounds<Pixels>>, x: Pixels) -> Option<u8> {
+        let bounds = bounds?;
+        if f32::from(bounds.size.width) <= 0.0 {
+            return None;
+        }
+        let frac = (f32::from(x - bounds.origin.x) / f32::from(bounds.size.width)).clamp(0.0, 1.0);
+        Some((frac * 100.0).round() as u8)
+    }
+
+    /// Interactive temperature-to-duty curve editor: painted curve with
+    /// draggable points, live operating-point marker, axis labels.
+    fn render_curve_graph(
+        &self,
+        fan: FanId,
+        points: &[CurvePoint],
+        temp: f32,
+        cx: &Context<Self>,
+    ) -> Div {
+        let name = fan.to_string();
+        let bounds_cell: Rc<RefCell<Option<Bounds<Pixels>>>> = Rc::default();
+        let pts: Vec<CurvePoint> = points.to_vec();
+        let operating_duty = CurveDef::from_points(points.to_vec()).duty_at(temp);
+
+        let paint_pts = pts.clone();
+        let graph = canvas(
+            {
+                let bounds_cell = Rc::clone(&bounds_cell);
+                move |bounds: Bounds<Pixels>, _: &mut Window, _: &mut App| {
+                    *bounds_cell.borrow_mut() = Some(bounds);
+                }
+            },
+            move |bounds: Bounds<Pixels>, _: (), window: &mut Window, _: &mut App| {
+                // Grid: 5 horizontal (duty steps), 6 vertical (temp steps).
+                for i in 0..=4 {
+                    let y = bounds.origin.y + bounds.size.height * (i as f32 / 4.0);
+                    window.paint_quad(fill(
+                        Bounds::new(point(bounds.origin.x, y), size(bounds.size.width, px(1.))),
+                        BORDER,
+                    ));
+                }
+                for i in 0..=5 {
+                    let x = bounds.origin.x + bounds.size.width * (i as f32 / 5.0);
+                    window.paint_quad(fill(
+                        Bounds::new(point(x, bounds.origin.y), size(px(1.), bounds.size.height)),
+                        BORDER,
+                    ));
+                }
+                if paint_pts.is_empty() {
+                    return;
+                }
+                let xy = |p: &CurvePoint| {
+                    point(
+                        bounds.origin.x + bounds.size.width * (p.0 / 100.0).min(1.0),
+                        bounds.origin.y + bounds.size.height * (1.0 - f32::from(p.1) / 100.0),
+                    )
+                };
+                // Area fill under the curve.
+                let mut area = PathBuilder::fill();
+                area.move_to(xy(&paint_pts[0]));
+                for p in paint_pts.iter().skip(1) {
+                    area.line_to(xy(p));
+                }
+                let last = xy(paint_pts.last().unwrap());
+                let first = xy(&paint_pts[0]);
+                area.line_to(point(last.x, bounds.origin.y + bounds.size.height));
+                area.line_to(point(first.x, bounds.origin.y + bounds.size.height));
+                if let Ok(path) = area.build() {
+                    window.paint_path(path, ACCENT.opacity(0.12));
+                }
+                // Curve line.
+                let mut line = PathBuilder::stroke(px(2.));
+                line.move_to(first);
+                for p in paint_pts.iter().skip(1) {
+                    line.line_to(xy(p));
+                }
+                if let Ok(path) = line.build() {
+                    window.paint_path(path, ACCENT);
+                }
+            },
+        )
+        .absolute()
+        .inset_0();
+
+        let curve_dot = |frac_x: f32, frac_y: f32, color: Hsla, diameter: f32| {
+            div()
+                .absolute()
+                .size(px(diameter))
+                .rounded_full()
+                .bg(color)
+                .border_2()
+                .border_color(BG)
+                .left(relative(frac_x.clamp(0.0, 1.0)))
+                .top(relative(frac_y.clamp(0.0, 1.0)))
+                .ml(px(-diameter / 2.0))
+                .mt(px(-diameter / 2.0))
+        };
+
+        let overlay = div()
+            .absolute()
+            .inset_0()
+            .cursor_pointer()
+            .on_mouse_down(MouseButton::Left, {
+                let bounds_cell = Rc::clone(&bounds_cell);
+                let name = name.clone();
+                cx.listener(move |this, ev: &MouseDownEvent, _window, cx| {
+                    let Some(bounds) = *bounds_cell.borrow() else {
+                        return;
+                    };
+                    let pts = this.fan_points(fan);
+                    let rel_x = f32::from(ev.position.x - bounds.origin.x);
+                    let rel_y = f32::from(ev.position.y - bounds.origin.y);
+                    let mut best: Option<(usize, f32)> = None;
+                    for (i, p) in pts.iter().enumerate() {
+                        let px_x = f32::from(bounds.size.width) * (p.0 / 100.0).min(1.0);
+                        let px_y = f32::from(bounds.size.height) * (1.0 - f32::from(p.1) / 100.0);
+                        let dist = ((rel_x - px_x).powi(2) + (rel_y - px_y).powi(2)).sqrt();
+                        if dist <= 16.0 && best.map_or(true, |(_, d)| dist < d) {
+                            best = Some((i, dist));
+                        }
+                    }
+                    if let Some((i, _)) = best {
+                        this.drag_point = Some((name.clone(), i));
+                        cx.notify();
+                    }
+                })
+            })
+            .on_mouse_move({
+                let bounds_cell = Rc::clone(&bounds_cell);
+                let name = name.clone();
+                cx.listener(move |this, ev: &MouseMoveEvent, _window, cx| {
+                    let Some((f, idx)) = this.drag_point.clone() else {
+                        return;
+                    };
+                    if f != name || ev.pressed_button != Some(MouseButton::Left) {
+                        return;
+                    }
+                    let Some(bounds) = *bounds_cell.borrow() else {
+                        return;
+                    };
+                    if f32::from(bounds.size.width) <= 0.0 || f32::from(bounds.size.height) <= 0.0 {
+                        return;
+                    }
+                    let mut pts = this.fan_points(fan);
+                    let Some(_slot) = pts.get_mut(idx) else {
+                        return;
+                    };
+                    let fx = ((f32::from(ev.position.x - bounds.origin.x)
+                        / f32::from(bounds.size.width))
+                        * 100.0)
+                        .clamp(0.0, 100.0);
+                    let fy = ((f32::from(ev.position.y - bounds.origin.y)
+                        / f32::from(bounds.size.height))
+                        * 100.0)
+                        .clamp(0.0, 100.0);
+                    // Strictly increasing temps against the neighbors.
+                    let lo = if idx > 0 { pts[idx - 1].0 + 1.0 } else { 0.0 };
+                    let hi = pts.get(idx + 1).map_or(100.0, |p| p.0 - 1.0);
+                    if lo > hi {
+                        return;
+                    }
+                    pts[idx] = CurvePoint(
+                        fx.clamp(lo, hi),
+                        (100.0 - fy).round().clamp(0.0, 100.0) as u8,
+                    );
+                    this.curve_draft.insert(name.clone(), pts);
+                    cx.notify();
+                })
+            })
+            .on_mouse_up(MouseButton::Left, {
+                let name = name.clone();
+                cx.listener(move |this, _ev: &MouseUpEvent, _window, cx| {
+                    let Some((f, _)) = this.drag_point.clone() else {
+                        return;
+                    };
+                    if f != name {
+                        return;
+                    }
+                    let points = this.curve_draft.get(&name).cloned();
+                    if let Some(points) = points {
+                        this.commit_curve(fan, points);
+                    }
+                    this.drag_point = None;
+                    cx.notify();
+                })
+            });
+
+        let fan_label = if fan == FanId::Cpu { "CPU" } else { "GPU" };
+
+        v_flex()
+            .flex_1()
+            .min_h(px(240.))
+            .gap_2()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(svg_icon(icons::CHART_LINE, TEXT_MUTED, 14.).into_any_element())
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(TEXT)
+                            .child(format!("Fan curve ({fan_label})")),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .flex_1()
+                    .min_h_0()
+                    .child(v_flex().justify_between().h_full().w(px(24.)).children(
+                        [100, 75, 50, 25, 0].map(|v| {
+                            div()
+                                .text_size(px(10.))
+                                .text_right()
+                                .text_color(TEXT_FAINT)
+                                .child(format!("{v}"))
+                        }),
+                    ))
+                    .child(
+                        div()
+                            .relative()
+                            .flex_1()
+                            .min_h_0()
+                            .child(graph)
+                            .children(pts.iter().enumerate().map(|(i, p)| {
+                                let dragged = self
+                                    .drag_point
+                                    .as_ref()
+                                    .is_some_and(|(f, di)| f == &name && *di == i);
+                                curve_dot(
+                                    p.0 / 100.0,
+                                    1.0 - f32::from(p.1) / 100.0,
+                                    ACCENT,
+                                    if dragged { 14.0 } else { 10.0 },
+                                )
+                            }))
+                            // live operating point (white marker)
+                            .child(curve_dot(
+                                temp / 100.0,
+                                1.0 - f32::from(operating_duty) / 100.0,
+                                TEXT,
+                                6.0,
+                            ))
+                            .child(overlay),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .justify_between()
+                    .pl(px(24.))
+                    .children([0, 20, 40, 60, 80, 100].map(|v| {
+                        div()
+                            .text_size(px(10.))
+                            .text_color(TEXT_FAINT)
+                            .child(format!("{v}"))
+                    })),
+            )
+            .child(
+                div()
+                    .pl(px(24.))
+                    .text_size(px(10.))
+                    .text_color(TEXT_FAINT)
+                    .child("Temperature (°C)"),
+            )
+    }
+
+    /// Curve-mode right panel: preset curves + the selected curve's points.
+    fn render_curve_panel(&self, fan: FanId, points: &[CurvePoint], cx: &Context<Self>) -> Div {
+        let name = fan.to_string();
+        let active_curve = self.fan_curve_name(fan);
+        let curves: Vec<String> = self.config.curves.keys().cloned().collect();
+
+        v_flex()
+            .w(px(330.))
+            .flex_none()
+            .gap_3()
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(TEXT_MUTED)
+                    .child("Preset curves"),
+            )
+            .child(
+                h_flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .children(curves.iter().map(|cname| {
+                        let active = *cname == active_curve;
+                        div()
+                            .id(SharedString::new(format!("preset-{name}-{cname}")))
+                            .px_3()
+                            .py_1p5()
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
                             .rounded_md()
                             .border_1()
-                            .border_color(BORDER)
                             .when(active, |this| {
-                                this.bg(ACCENT)
-                                    .text_color(TEXT)
+                                this.bg(ACCENT_DIM).border_color(ACCENT).text_color(TEXT)
                             })
                             .when(!active, |this| {
-                                this.text_color(TEXT)
-                                    .hover(|this| this.bg(ACCENT_DIM))
-                            })
-                            .on_click(cx.listener(move |this, _ev: &ClickEvent, _window, cx| {
-                                let config = match kind {
-                                    FanModeKind::Auto => FanConfig {
-                                        mode: FanModeKind::Auto,
-                                        curve: None,
-                                        manual_duty_pct: None,
-                                    },
-                                    FanModeKind::Manual => FanConfig {
-                                        mode: FanModeKind::Manual,
-                                        curve: None,
-                                        manual_duty_pct: Some(
-                                            this.fan_state(fan)
-                                                .and_then(|r| r.config.manual_duty_pct)
-                                                .unwrap_or(40),
-                                        ),
-                                    },
-                                    FanModeKind::Curve => FanConfig {
-                                        mode: FanModeKind::Curve,
-                                        curve: Some(this.default_curve_name()),
-                                        manual_duty_pct: None,
-                                    },
-                                };
-                                this.send(GuiCommand::SetFan { fan, config });
-                                cx.notify();
-                            }))
-                            .child(label.to_string())
-                    }),
-                ),
-            )
-            .when(mode == FanModeKind::Manual, |this| {
-                this.child(
-                    h_flex()
-                        .gap_2()
-                        .items_center()
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(TEXT_MUTED)
-                                .child("duty"),
-                        )
-                        .children([("−5", -5i16), ("+5", 5), ("−15", -15), ("+15", 15)].map(
-                            |(sym, delta)| {
-                                div()
-                                    .id(SharedString::new(format!("{fan_label}-duty-{sym}")))
-                                    .px_3()
-                                    .py_1()
-                                    .text_sm()
-                                    .rounded_md()
-                                    .border_1()
+                                this.bg(BG)
                                     .border_color(BORDER)
-                                    .text_color(TEXT)
-                                    .hover(|this| this.bg(ACCENT_DIM))
-                                    .on_click(cx.listener(
-                                        move |this, _ev: &ClickEvent, _window, cx| {
-                                            let current = this
-                                                .fan_state(fan)
-                                                .and_then(|r| r.config.manual_duty_pct)
-                                                .unwrap_or(40);
-                                            let next =
-                                                (i16::from(current) + delta).clamp(0, 100) as u8;
-                                            this.send(GuiCommand::SetFan {
-                                                fan,
-                                                config: FanConfig {
-                                                    mode: FanModeKind::Manual,
-                                                    curve: None,
-                                                    manual_duty_pct: Some(next),
-                                                },
-                                            });
-                                            cx.notify();
+                                    .text_color(TEXT_MUTED)
+                                    .hover(|this| this.bg(SURFACE_RAISED).text_color(TEXT))
+                            })
+                            .on_click(cx.listener({
+                                let cname = cname.clone();
+                                move |this, _ev: &ClickEvent, _window, cx| {
+                                    this.curve_draft.remove(&fan.to_string());
+                                    this.send(GuiCommand::SetFan {
+                                        fan,
+                                        config: FanConfig {
+                                            mode: FanModeKind::Curve,
+                                            curve: Some(cname.clone()),
+                                            manual_duty_pct: None,
                                         },
-                                    ))
-                                    .child(sym.to_string())
-                            },
-                        ))
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(ACCENT)
-                                .child(format!("{manual_duty}%")),
-                        ),
-                )
-            })
-            .when(mode == FanModeKind::Curve, |this| {
-                this.child(
-                    h_flex()
-                        .flex_wrap()
-                        .gap_2()
-                        .children(self.config.curves.keys().map(|name| {
-                            let active = *name == curve_name;
-                            div()
-                                .id(SharedString::new(format!("{fan_label}-curve-{name}")))
-                                .px_3()
-                                .py_1()
-                                .text_sm()
-                                .rounded_md()
-                                .border_1()
-                                .border_color(BORDER)
-                                .when(active, |this| {
-                                    this.bg(ACCENT)
-                                        .text_color(TEXT)
-                                })
-                                .when(!active, |this| {
-                                    this.text_color(TEXT)
-                                        .hover(|this| this.bg(ACCENT_DIM))
-                                })
-                                .on_click({
-                                    let name = name.clone();
-                                    cx.listener(move |this, _ev: &ClickEvent, _window, cx| {
-                                        this.send(GuiCommand::SetFan {
-                                            fan,
-                                            config: FanConfig {
-                                                mode: FanModeKind::Curve,
-                                                curve: Some(name.clone()),
-                                                manual_duty_pct: None,
-                                            },
-                                        });
-                                        cx.notify();
-                                    })
-                                })
-                                .child(name.clone())
-                        })),
-                )
-            })
+                                    });
+                                    cx.notify();
+                                }
+                            }))
+                            .child(pretty_curve_name(cname))
+                    })),
+            )
+            .child(
+                div()
+                    .mt_1()
+                    .text_xs()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(TEXT_MUTED)
+                    .child("Curve points"),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .max_h(px(170.))
+                    .overflow_y_scrollbar()
+                    .children(points.iter().enumerate().map(|(i, p)| {
+                        let is_dragging = self
+                            .drag_point
+                            .as_ref()
+                            .is_some_and(|(f, di)| f == &name && *di == i);
+                        h_flex()
+                            .gap_3()
+                            .items_center()
+                            .px_3()
+                            .py_1p5()
+                            .rounded_md()
+                            .when(is_dragging, |this| this.bg(SURFACE_RAISED))
+                            .child(div().size(px(8.)).rounded_full().bg(ACCENT))
+                            .child(
+                                div()
+                                    .w(px(64.))
+                                    .text_sm()
+                                    .text_color(TEXT)
+                                    .child(format!("{:.0}°C", p.0)),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .text_sm()
+                                    .text_color(TEXT_MUTED)
+                                    .child(format!("{}%", p.1)),
+                            )
+                            .when(points.len() > 1, |this| {
+                                this.child(
+                                    div()
+                                        .id(SharedString::new(format!("pt-del-{name}-{i}")))
+                                        .px_1()
+                                        .text_sm()
+                                        .text_color(TEXT_FAINT)
+                                        .hover(|this| this.text_color(ACCENT))
+                                        .on_click(cx.listener({
+                                            let points = points.to_vec();
+                                            move |this, _ev: &ClickEvent, _window, cx| {
+                                                let mut pts = points.clone();
+                                                pts.remove(i);
+                                                this.commit_curve(fan, pts);
+                                                cx.notify();
+                                            }
+                                        }))
+                                        .child("✕"),
+                                )
+                            })
+                    })),
+            )
+            .child(
+                div()
+                    .id(SharedString::new(format!("pt-add-{name}")))
+                    .flex()
+                    .justify_center()
+                    .py_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(BORDER)
+                    .text_sm()
+                    .text_color(TEXT_MUTED)
+                    .hover(|this| this.bg(SURFACE_RAISED).text_color(TEXT))
+                    .on_click(cx.listener({
+                        let points = points.to_vec();
+                        move |this, _ev: &ClickEvent, _window, cx| {
+                            let mut pts = points.clone();
+                            let last = pts.last().copied().unwrap_or(CurvePoint(40.0, 40));
+                            let new_temp = if last.0 >= 99.0 {
+                                let prev = pts
+                                    .get(pts.len().saturating_sub(2))
+                                    .map(|p| p.0)
+                                    .unwrap_or(0.0);
+                                (prev + last.0) / 2.0
+                            } else {
+                                last.0 + 10.0
+                            };
+                            pts.push(CurvePoint(new_temp, last.1));
+                            this.commit_curve(fan, pts);
+                            cx.notify();
+                        }
+                    }))
+                    .child("+ Add point"),
+            )
+    }
+
+    /// One live-value tile (icon + label + value).
+    fn stat_tile(&self, icon: &'static str, label: &str, value: String) -> Div {
+        h_flex()
+            .gap_3()
+            .items_center()
+            .border_1()
+            .border_color(BORDER)
+            .rounded_md()
+            .px_4()
+            .py_3()
+            .bg(BG)
+            .child(svg_icon(icon, TEXT_MUTED, 16.))
+            .child(
+                v_flex()
+                    .gap_0p5()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(TEXT_MUTED)
+                            .child(label.to_string()),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(TEXT)
+                            .child(value),
+                    ),
+            )
+    }
+
+    /// Stat tiles: row form (manual/auto) or column form (curve mode).
+    fn render_fan_stats(
+        &self,
+        fan: FanId,
+        temp: f32,
+        target_speed: String,
+        target_rpm: String,
+        mode_label: &str,
+        column: bool,
+    ) -> Div {
+        let tiles = [
+            (icons::THERMOMETER, "Current temp", format!("{temp:.0}°C")),
+            (icons::FAN, "Current speed", target_speed),
+            (icons::GAUGE, "Target rpm", target_rpm),
+            (icons::SETTINGS, "Control mode", mode_label.to_string()),
+        ];
+        if column {
+            let fan_label = if fan == FanId::Cpu { "CPU" } else { "GPU" };
+            v_flex()
+                .w(px(150.))
+                .flex_none()
+                .gap_3()
+                .children(tiles.map(|(icon, label, value)| {
+                    self.stat_tile(icon, &format!("{label} ({fan_label})"), value)
+                }))
+        } else {
+            h_flex().gap_3().children(
+                tiles.map(|(icon, label, value)| self.stat_tile(icon, label, value).flex_1()),
+            )
+        }
     }
 
     fn render_fans(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -1147,9 +1815,31 @@ impl ThermiteApp {
             .map(|s| s.daemon.capability.level == CapabilityLevel::Full)
             .unwrap_or(false);
         v_flex()
-            .p_4()
-            .gap_4()
+            .p_5()
+            .gap_5()
             .flex_1()
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(TEXT_FAINT)
+                            .child("FAN CONTROL"),
+                    )
+                    .child(
+                        div()
+                            .text_2xl()
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(TEXT)
+                            .child("Fan Control"),
+                    )
+                    .child(div().text_sm().text_color(TEXT_MUTED).child(format!(
+                        "Manage fan modes, custom curves and fan speeds for your {}",
+                        self.machine.product
+                    ))),
+            )
             .when(!full_control, |this| {
                 this.child(
                     div()
@@ -1166,195 +1856,7 @@ impl ThermiteApp {
                         ),
                 )
             })
-            .child(
-                h_flex()
-                    .gap_4()
-                    .flex_none()
-                    .child(self.render_fan_card(FanId::Cpu, cx)),
-            )
-            .child(
-                h_flex()
-                    .gap_4()
-                    .flex_none()
-                    .child(self.render_fan_card(FanId::Gpu, cx)),
-            )
-    }
-
-    fn render_curves(&self, cx: &Context<Self>) -> impl IntoElement {
-        let names: Vec<String> = self.config.curves.keys().cloned().collect();
-        let selected = self.selected_curve.clone();
-        let points = self.editing_points();
-
-        v_flex()
-            .p_4()
-            .gap_4()
-            .flex_1()
-            .child(
-                h_flex()
-                    .flex_wrap()
-                    .gap_2()
-                    .children(names.iter().map(|name| {
-                        let active = *name == selected;
-                        div()
-                            .id(SharedString::new(format!("curve-tab-{name}")))
-                            .px_3()
-                            .py_1()
-                            .text_sm()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(BORDER)
-                            .when(active, |this| {
-                                this.bg(ACCENT)
-                                    .text_color(TEXT)
-                            })
-                            .when(!active, |this| {
-                                this.text_color(TEXT)
-                                    .hover(|this| this.bg(ACCENT_DIM))
-                            })
-                            .on_click({
-                                let name = name.clone();
-                                cx.listener(move |this, _ev: &ClickEvent, _window, cx| {
-                                    this.selected_curve = name.clone();
-                                    this.curve_edit = None;
-                                    cx.notify();
-                                })
-                            })
-                            .child(name.clone())
-                    })),
-            )
-            .when_some(points, |this, points| {
-                this.child(
-                    v_flex()
-                        .gap_1()
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(TEXT_MUTED)
-                                .child(format!(
-                                    "{selected} — adjust points, then Save (temps strictly \
-                                     increasing, duty 0-100)"
-                                )),
-                        )
-                        .children(points.iter().enumerate().map(|(i, p)| {
-                            h_flex()
-                                .gap_3()
-                                .items_center()
-                                .px_2()
-                                .py_1()
-                                .rounded_sm()
-                                .hover(|this| this.bg(ACCENT_DIM))
-                                .child(
-                                    div()
-                                        .w(px(64.))
-                                        .text_sm()
-                                        .text_color(TEXT_MUTED)
-                                        .child(format!("{:.0}°C", p.0)),
-                                )
-                                .child(
-                                    div()
-                                        .w(px(64.))
-                                        .text_sm()
-                                        .text_color(ACCENT)
-                                        .child(format!("{}%", p.1)),
-                                )
-                                .child(
-                                    h_flex().gap_1().children(
-                                        [
-                                            ("temp −5", -5.0f32, 0i16),
-                                            ("temp +5", 5.0, 0),
-                                            ("duty −5", 0.0, -5),
-                                            ("duty +5", 0.0, 5),
-                                        ]
-                                        .map(
-                                            |(sym, dt, dd)| {
-                                                div()
-                                                .id(SharedString::new(format!(
-                                                    "curve-pt-{i}-{sym}"
-                                                )))
-                                                .px_2()
-                                                .py_1()
-                                                .text_xs()
-                                                .rounded_sm()
-                                                .border_1()
-                                                .border_color(BORDER)
-                                                .hover(|this| {
-                                                    this.bg(ACCENT_DIM)
-                                                })
-                                                .on_click(cx.listener(
-                                                    move |this, _ev: &ClickEvent, _window, cx| {
-                                                        this.adjust_curve_point(i, dt, dd);
-                                                        cx.notify();
-                                                    },
-                                                ))
-                                                .child(sym.to_string())
-                                            },
-                                        ),
-                                    ),
-                                )
-                                .when(points.len() > 1, |this| {
-                                    this.child(
-                                        div()
-                                            .id(SharedString::new(format!("curve-del-{i}")))
-                                            .px_2()
-                                            .py_1()
-                                            .text_xs()
-                                            .rounded_sm()
-                                            .border_1()
-                                            .border_color(BORDER)
-                                            .text_color(ACCENT)
-                                            .hover(|this| this.bg(SURFACE))
-                                            .on_click(cx.listener(
-                                                move |this, _ev: &ClickEvent, _window, cx| {
-                                                    this.delete_curve_point(i);
-                                                    cx.notify();
-                                                },
-                                            ))
-                                            .child("remove"),
-                                    )
-                                })
-                        }))
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .id("curve-add-point")
-                                        .px_3()
-                                        .py_1()
-                                        .text_sm()
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(BORDER)
-                                        .hover(|this| this.bg(ACCENT_DIM))
-                                        .on_click(cx.listener(
-                                            |this, _ev: &ClickEvent, _window, cx| {
-                                                this.add_curve_point();
-                                                cx.notify();
-                                            },
-                                        ))
-                                        .child("add point"),
-                                )
-                                .child(
-                                    div()
-                                        .id("curve-save")
-                                        .px_3()
-                                        .py_1()
-                                        .text_sm()
-                                        .rounded_md()
-                                        .bg(ACCENT)
-                                        .text_color(TEXT)
-                                        .hover(|this| this.opacity(0.9))
-                                        .on_click(cx.listener(
-                                            |this, _ev: &ClickEvent, _window, cx| {
-                                                this.save_curve();
-                                                cx.notify();
-                                            },
-                                        ))
-                                        .child("save"),
-                                ),
-                        ),
-                )
-            })
+            .children(FanId::all().map(|fan| self.render_fan_card(fan, cx)))
     }
 
     fn render_profiles(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -1393,11 +1895,7 @@ impl ThermiteApp {
                     .py_3()
                     .rounded_md()
                     .border_1()
-                    .border_color(if is_active {
-                        ACCENT
-                    } else {
-                        BORDER
-                    })
+                    .border_color(if is_active { ACCENT } else { BORDER })
                     .when(is_active, |this| this.bg(ACCENT_DIM))
                     .hover(|this| this.bg(ACCENT_DIM))
                     .on_click({
@@ -1414,12 +1912,7 @@ impl ThermiteApp {
                             .justify_between()
                             .child(div().text_base().child(name.clone()))
                             .when(is_active, |this| {
-                                this.child(
-                                    div()
-                                        .text_sm()
-                                        .text_color(ACCENT)
-                                        .child("active"),
-                                )
+                                this.child(div().text_sm().text_color(ACCENT).child("active"))
                             }),
                     )
             }))
@@ -1457,27 +1950,26 @@ impl ThermiteApp {
                     .child("·")
                     .child(format!("{}", self.socket.display())),
             )
-            .child(h_flex().gap_2().items_center().when_some(
-                toast_msg,
-                |this, msg| {
-                    this.text_color(if toast_err.unwrap_or(false) {
-                        err_color
-                    } else {
-                        ok_color
-                    })
-                    .child(
-                        div()
-                            .size(px(6.))
-                            .rounded_full()
-                            .bg(if toast_err.unwrap_or(false) {
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .when_some(toast_msg, |this, msg| {
+                        this.text_color(if toast_err.unwrap_or(false) {
+                            err_color
+                        } else {
+                            ok_color
+                        })
+                        .child(div().size(px(6.)).rounded_full().bg(
+                            if toast_err.unwrap_or(false) {
                                 err_color
                             } else {
                                 ok_color
-                            }),
-                    )
-                    .child(msg)
-                },
-            ))
+                            },
+                        ))
+                        .child(msg)
+                    }),
+            )
     }
 
     fn render_alerts_panel(&self) -> impl IntoElement {
@@ -1504,6 +1996,21 @@ impl ThermiteApp {
                     .child(format!("{:?}: {}", a.kind, a.message))
             }))
             .into_any_element()
+    }
+}
+
+/// "quiet-battery" -> "Quiet (Battery)", "balanced" -> "Balanced".
+fn pretty_curve_name(name: &str) -> String {
+    fn cap(s: &str) -> String {
+        let mut c = s.chars();
+        match c.next() {
+            Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+            None => String::new(),
+        }
+    }
+    match name.strip_suffix("-battery") {
+        Some(base) => format!("{} (Battery)", cap(base)),
+        None => cap(name),
     }
 }
 
@@ -1545,7 +2052,6 @@ impl Render for ThermiteApp {
                             .map(|this| match self.nav {
                                 Nav::Dashboard => this.child(self.render_dashboard(cx)),
                                 Nav::Fans => this.child(self.render_fans(cx)),
-                                Nav::Curves => this.child(self.render_curves(cx)),
                                 Nav::Profiles => this.child(self.render_profiles(cx)),
                             }),
                     ),
