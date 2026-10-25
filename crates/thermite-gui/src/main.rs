@@ -41,6 +41,10 @@ mod icons {
     pub const SETTINGS: &str = include_str!("../assets/icons/settings.svg");
     pub const INFO: &str = include_str!("../assets/icons/info.svg");
     pub const MONITOR: &str = include_str!("../assets/icons/monitor.svg");
+    pub const LEAF: &str = include_str!("../assets/icons/leaf.svg");
+    pub const MOON: &str = include_str!("../assets/icons/moon.svg");
+    pub const SCALE: &str = include_str!("../assets/icons/scale.svg");
+    pub const TRENDING_UP: &str = include_str!("../assets/icons/trending-up.svg");
 }
 
 /// Render a bundled Lucide SVG at a given size and color.
@@ -202,6 +206,8 @@ pub struct ThermiteApp {
     slider_drag: Option<String>,
     /// Last instant a slider drag sent SetFanConfig (throttled).
     last_slider_send: Option<(String, Instant)>,
+    /// Profile selected for inspection on the Profiles page.
+    selected_profile: Option<String>,
 }
 
 impl ThermiteApp {
@@ -249,6 +255,7 @@ impl ThermiteApp {
             drag_point: None,
             slider_drag: None,
             last_slider_send: None,
+            selected_profile: None,
         }
     }
 
@@ -1926,11 +1933,48 @@ impl ThermiteApp {
             ),
             None => (Vec::new(), String::new()),
         };
+        let manages = self.config.platform.active.is_some();
 
+        let selected = self
+            .selected_profile
+            .clone()
+            .or_else(|| available.first().cloned());
+        let selected_meta = selected
+            .as_deref()
+            .and_then(thermite_core::PlatformProfile::parse)
+            .map(|p| profile_meta(&p));
+
+        // Left: profile list. Right: detail panel.
         v_flex()
-            .p_4()
-            .gap_3()
-            .flex_1()
+            .p_5()
+            .gap_5()
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(TEXT_FAINT)
+                            .child("PROFILES"),
+                    )
+                    .child(
+                        div()
+                            .text_2xl()
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(TEXT)
+                            .child("Thermal Profiles"),
+                    )
+                    .child(div().text_sm().text_color(TEXT_MUTED).child(format!(
+                        "Firmware performance modes for your {}. Applying is handled by {}.",
+                        self.machine.product,
+                        if manages {
+                            "Thermite"
+                        } else {
+                            "power-profiles-daemon"
+                        }
+                    ))),
+            )
             .when(available.is_empty(), |this| {
                 this.child(
                     div()
@@ -1946,35 +1990,444 @@ impl ThermiteApp {
                         ),
                 )
             })
-            .children(available.iter().map(|name| {
-                let is_active = *name == active;
-                div()
-                    .id(SharedString::new(format!("profile-{name}")))
-                    .px_4()
-                    .py_3()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(if is_active { ACCENT } else { BORDER })
-                    .when(is_active, |this| this.bg(ACCENT_DIM))
-                    .hover(|this| this.bg(ACCENT_DIM))
-                    .on_click({
-                        let name = name.clone();
-                        cx.listener(move |this, _ev: &ClickEvent, _window, cx| {
-                            this.send(GuiCommand::SetProfile {
-                                profile: name.clone(),
-                            });
-                            cx.notify();
-                        })
-                    })
+            .child(
+                h_flex()
+                    .gap_4()
+                    .items_stretch()
+                    // ---- list column ----
                     .child(
-                        h_flex()
-                            .justify_between()
-                            .child(div().text_base().child(name.clone()))
-                            .when(is_active, |this| {
-                                this.child(div().text_sm().text_color(ACCENT).child("active"))
-                            }),
+                        v_flex()
+                            .w(relative(0.55))
+                            .flex_none()
+                            .min_w_0()
+                            .gap_3()
+                            .children(available.iter().map(|name| {
+                                self.render_profile_row(
+                                    name,
+                                    name == active.as_str(),
+                                    selected.as_deref() == Some(name),
+                                    manages,
+                                    cx,
+                                )
+                            })),
                     )
+                    // ---- detail column ----
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .border_1()
+                            .border_color(BORDER)
+                            .rounded_lg()
+                            .bg(SURFACE)
+                            .p_5()
+                            .gap_4()
+                            .children(selected_meta.map(|(icon, title, desc, behavior)| {
+                                let is_active = title.as_str() == active.as_str();
+                                self.render_profile_detail(
+                                    selected.as_deref().unwrap_or_default(),
+                                    icon,
+                                    title,
+                                    desc,
+                                    behavior,
+                                    is_active,
+                                    manages,
+                                    cx,
+                                )
+                            })),
+                    ),
+            )
+    }
+
+    /// One row in the profile list: icon, name, description, and either an
+    /// Apply button or the Active chip.
+    #[allow(clippy::type_complexity)]
+    fn render_profile_row(
+        &self,
+        name: &str,
+        is_active: bool,
+        is_selected: bool,
+        manages: bool,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
+        let meta = thermite_core::PlatformProfile::parse(name).map(|p| profile_meta(&p));
+        let (icon, title, desc) = meta.map(|(i, t, d, _)| (i, t, d)).unwrap_or_else(|| {
+            (
+                icons::SETTINGS,
+                name.to_string(),
+                "Firmware-defined profile.".to_string(),
+            )
+        });
+
+        div()
+            .id(SharedString::new(format!("profile-row-{name}")))
+            .border_1()
+            .when(is_active || is_selected, |this| {
+                this.border_color(if is_active { ACCENT } else { BORDER })
+            })
+            .when(is_active, |this| this.bg(ACCENT_DIM))
+            .when(!is_active, |this| this.bg(SURFACE))
+            .rounded_lg()
+            .p_4()
+            .hover(|this| this.bg(SURFACE_RAISED.opacity(0.5)))
+            .on_click(cx.listener({
+                let name = name.to_string();
+                move |this, _ev: &ClickEvent, _window, cx| {
+                    this.selected_profile = Some(name.clone());
+                    cx.notify();
+                }
             }))
+            .child(
+                h_flex()
+                    .gap_3()
+                    .items_center()
+                    .child(svg_icon(
+                        icon,
+                        if is_active { ACCENT } else { TEXT_MUTED },
+                        20.,
+                    ))
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .gap_0p5()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(TEXT)
+                                    .child(title),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(TEXT_MUTED)
+                                    .truncate()
+                                    .child(desc),
+                            ),
+                    )
+                    .child(div().flex_1())
+                    .when(is_active, |this| {
+                        this.child(
+                            div()
+                                .px_3()
+                                .py_1()
+                                .rounded_md()
+                                .bg(ACCENT)
+                                .text_xs()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(TEXT)
+                                .child("Active"),
+                        )
+                    })
+                    .when(!is_active && manages, |this| {
+                        this.child(
+                            div()
+                                .id(SharedString::new(format!("profile-apply-{name}")))
+                                .px_4()
+                                .py_1p5()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(BORDER)
+                                .text_xs()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(TEXT)
+                                .hover(|this| this.bg(ACCENT).border_color(ACCENT))
+                                .on_click(cx.listener({
+                                    let name = name.to_string();
+                                    move |this, _ev: &ClickEvent, _window, cx| {
+                                        this.send(GuiCommand::SetProfile {
+                                            profile: name.clone(),
+                                        });
+                                        cx.notify();
+                                    }
+                                }))
+                                .child("Apply"),
+                        )
+                    }),
+            )
+    }
+
+    /// Detail panel for the selected profile. Only real, readable state is
+    /// shown: firmware mapping, availability, the matching fan curve from
+    /// the live config, and the always-on failsafe overlay.
+    #[allow(clippy::too_many_arguments)]
+    fn render_profile_detail(
+        &self,
+        name: &str,
+        icon: &'static str,
+        title: String,
+        desc: String,
+        behavior: String,
+        is_active: bool,
+        manages: bool,
+        cx: &Context<Self>,
+    ) -> Div {
+        let f = &self.config.failsafe;
+        // The fan curve conventionally named after this profile, from the
+        // live config (both fans may follow it; shown as-is).
+        let curve = self.config.curves.get(name);
+
+        v_flex()
+            // Header
+            .child(
+                h_flex()
+                    .gap_3()
+                    .items_start()
+                    .child(
+                        div()
+                            .size(px(44.))
+                            .rounded_md()
+                            .bg(ACCENT_DIM)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(svg_icon(icon, ACCENT, 22.)),
+                    )
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .gap_0p5()
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .child(
+                                        div()
+                                            .text_lg()
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(TEXT)
+                                            .child(title.clone()),
+                                    )
+                                    .when(is_active, |this| {
+                                        this.child(
+                                            div()
+                                                .px_2()
+                                                .py_0p5()
+                                                .rounded_md()
+                                                .bg(ACCENT)
+                                                .text_xs()
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .text_color(TEXT)
+                                                .child("Active"),
+                                        )
+                                    }),
+                            )
+                            .child(div().text_xs().text_color(TEXT_MUTED).child(desc)),
+                    ),
+            )
+            // Configuration rows
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(TEXT_MUTED)
+                            .child("Profile configuration"),
+                    )
+                    .child(self.detail_row(
+                        icons::SHIELD_CHECK,
+                        "Availability".to_string(),
+                        "Offered by this firmware".to_string(),
+                    ))
+                    .child(self.detail_row(
+                        icons::SETTINGS,
+                        "Firmware mode".to_string(),
+                        behavior.clone(),
+                    ))
+                    .child(self.detail_row(
+                        icons::SHIELD_CHECK,
+                        "Failsafe overlay".to_string(),
+                        format!(
+                            "CPU {}°C · GPU {}°C → firmware control",
+                            f.cpu_crit_c, f.gpu_crit_c
+                        ),
+                    ))
+                    .child(self.detail_row(
+                        icons::INFO,
+                        "Profile ownership".to_string(),
+                        if manages {
+                            "Thermite keeps this profile applied".to_string()
+                        } else {
+                            "power-profiles-daemon owns profile switching".to_string()
+                        },
+                    )),
+            )
+            // Fan curve preview (real config data)
+            .child(
+                v_flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(TEXT_MUTED)
+                            .child("Fan curve preview"),
+                    )
+                    .children(curve.map(|c| {
+                        v_flex()
+                            .gap_1()
+                            .child(div().text_xs().text_color(TEXT_MUTED).child(format!(
+                                "Fan curve \"{name}\" — {:.0}°C/{:.0}% → {:.0}°C/100%",
+                                c.points.first().map(|p| p.0).unwrap_or(0.0),
+                                c.points.first().map(|p| p.1).unwrap_or(0),
+                                c.points.last().map(|p| p.0).unwrap_or(100.0),
+                            )))
+                            .child(self.render_mini_curve(&c.points))
+                    }))
+                    .when(curve.is_none(), |this| {
+                        this.child(div().text_xs().text_color(TEXT_FAINT).child(format!(
+                            "No fan curve named \"{name}\" in the config — assign curves \
+                                 per fan on the Fans page."
+                        )))
+                    }),
+            )
+            // Apply button
+            .child(
+                div()
+                    .id(SharedString::new(format!("detail-apply-{name}")))
+                    .when(is_active, |this| {
+                        this.flex()
+                            .justify_center()
+                            .py_2p5()
+                            .rounded_md()
+                            .bg(BG)
+                            .border_1()
+                            .border_color(BORDER)
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(TEXT_MUTED)
+                            .child("Active — this profile is applied")
+                    })
+                    .when(!is_active && manages, |this| {
+                        this.flex()
+                            .justify_center()
+                            .py_2p5()
+                            .rounded_md()
+                            .bg(ACCENT)
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(TEXT)
+                            .hover(|this| this.opacity(0.9))
+                            .on_click(cx.listener({
+                                let name = name.to_string();
+                                move |this, _ev: &ClickEvent, _window, cx| {
+                                    this.send(GuiCommand::SetProfile {
+                                        profile: name.clone(),
+                                    });
+                                    cx.notify();
+                                }
+                            }))
+                            .child("Apply profile")
+                    })
+                    .when(!is_active && !manages, |this| {
+                        this.flex()
+                            .justify_center()
+                            .py_2p5()
+                            .rounded_md()
+                            .bg(BG)
+                            .border_1()
+                            .border_color(BORDER)
+                            .text_sm()
+                            .text_color(TEXT_MUTED)
+                            .child("Switch profiles with power-profiles-daemon")
+                    }),
+            )
+    }
+
+    /// One labeled row in the detail panel.
+    fn detail_row(&self, icon: &'static str, label: String, value: String) -> Div {
+        h_flex()
+            .gap_3()
+            .items_center()
+            .px_3()
+            .py_2p5()
+            .rounded_md()
+            .bg(BG)
+            .border_1()
+            .border_color(BORDER)
+            .child(svg_icon(icon, TEXT_MUTED, 14.))
+            .child(div().text_sm().text_color(TEXT_MUTED).child(label))
+            .child(div().flex_1())
+            .child(
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(TEXT)
+                    .truncate()
+                    .child(value),
+            )
+    }
+
+    /// Small static temperature→duty preview chart (canvas-painted).
+    fn render_mini_curve(&self, points: &[CurvePoint]) -> Div {
+        let pts: Vec<(f32, f32)> = points.iter().map(|p| (p.0, f32::from(p.1))).collect();
+        div()
+            .relative()
+            .h(px(120.))
+            .rounded_md()
+            .bg(BG)
+            .border_1()
+            .border_color(BORDER)
+            .child(
+                canvas(
+                    |_: Bounds<Pixels>, _: &mut Window, _: &mut App| {},
+                    move |bounds: Bounds<Pixels>, _: (), window: &mut Window, _: &mut App| {
+                        let w = f32::from(bounds.size.width);
+                        let h = f32::from(bounds.size.height);
+                        if w <= 0.0 || h <= 0.0 {
+                            return;
+                        }
+                        let xy = move |t: f32, d: f32| {
+                            point(
+                                bounds.origin.x + px(w * (t / 100.0).clamp(0.0, 1.0)),
+                                bounds.origin.y + px(h * (1.0 - (d / 100.0).clamp(0.0, 1.0))),
+                            )
+                        };
+                        // baseline
+                        window.paint_quad(fill(
+                            Bounds::new(
+                                point(
+                                    bounds.origin.x,
+                                    bounds.origin.y + bounds.size.height - px(1.),
+                                ),
+                                size(bounds.size.width, px(1.)),
+                            ),
+                            BORDER,
+                        ));
+                        if pts.is_empty() {
+                            return;
+                        }
+                        let Some((ft, fd)) = pts.first().copied() else {
+                            return;
+                        };
+                        let Some((lt, _ld)) = pts.last().copied() else {
+                            return;
+                        };
+                        let mut area = PathBuilder::fill();
+                        area.move_to(xy(ft, fd));
+                        for (t, d) in pts.iter().skip(1) {
+                            area.line_to(xy(*t, *d));
+                        }
+                        area.line_to(xy(lt, 0.0));
+                        area.line_to(xy(ft, 0.0));
+                        if let Ok(path) = area.build() {
+                            window.paint_path(path, ACCENT.opacity(0.15));
+                        }
+                        let mut line = PathBuilder::stroke(px(2.));
+                        line.move_to(xy(ft, fd));
+                        for (t, d) in pts.iter().skip(1) {
+                            line.line_to(xy(*t, *d));
+                        }
+                        if let Ok(path) = line.build() {
+                            window.paint_path(path, ACCENT);
+                        }
+                    },
+                )
+                .absolute()
+                .inset_0(),
+            )
     }
 
     fn render_status_bar(&self) -> impl IntoElement {
@@ -2023,7 +2476,7 @@ impl ThermiteApp {
                             if toast_err.unwrap_or(false) {
                                 err_color
                             } else {
-                                ok_color
+                                OK
                             },
                         ))
                         .child(msg)
@@ -2055,6 +2508,50 @@ impl ThermiteApp {
                     .child(format!("{:?}: {}", a.kind, a.message))
             }))
             .into_any_element()
+    }
+}
+
+/// Verified firmware semantics for each profile (see docs/HARDWARE.md).
+/// Returns (icon, title, description, firmware-mode note).
+fn profile_meta(p: &thermite_core::PlatformProfile) -> (&'static str, String, String, String) {
+    match p {
+        thermite_core::PlatformProfile::LowPower => (
+            icons::LEAF,
+            "Low Power".to_string(),
+            "Lowest power draw (Acer Eco mode). Fans stay quiet; best on battery.".to_string(),
+            "Eco — the firmware's power-sipping mode".to_string(),
+        ),
+        thermite_core::PlatformProfile::Quiet => (
+            icons::MOON,
+            "Quiet".to_string(),
+            "Firmware quiet bias — lower fan baseline for light desktop workloads.".to_string(),
+            "Quiet (0x00)".to_string(),
+        ),
+        thermite_core::PlatformProfile::Balanced => (
+            icons::SCALE,
+            "Balanced".to_string(),
+            "Factory default balance of thermals, noise and performance.".to_string(),
+            "Balanced (0x01)".to_string(),
+        ),
+        thermite_core::PlatformProfile::BalancedPerformance => (
+            icons::TRENDING_UP,
+            "Balanced Performance".to_string(),
+            "Acer's high-performance mode — the strongest profile this BIOS honors.".to_string(),
+            "Performance (0x04) — the real max on this firmware".to_string(),
+        ),
+        thermite_core::PlatformProfile::Performance => (
+            icons::ZAP,
+            "Performance".to_string(),
+            "Requests Acer Turbo mode. This BIOS rejects it — the selection silently reverts."
+                .to_string(),
+            "Turbo (0x05) — refused by this firmware".to_string(),
+        ),
+        thermite_core::PlatformProfile::Turbo => (
+            icons::ZAP,
+            "Turbo".to_string(),
+            "Rejected by this firmware; not offered.".to_string(),
+            "Turbo (0x05)".to_string(),
+        ),
     }
 }
 
