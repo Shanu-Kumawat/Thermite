@@ -2,6 +2,12 @@
 
 **This module is temporary. Delete it when your kernel is ≥ 7.3.**
 
+## License
+
+`acer-wmi.c` here is a patched copy of **GPL-2.0** kernel source and stays
+GPL-2.0-only; the project-wide MIT license does **not** apply to files in
+this directory.
+
 ## What this is
 
 The mainline `acer-wmi` driver with the **Acer Nitro ANV15-51 quirk** that

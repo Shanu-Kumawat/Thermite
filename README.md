@@ -1,80 +1,127 @@
 # Thermite
 
-Thermal management for the **Acer Nitro V 15 (ANV15-51)** on Linux: a privileged
-daemon with custom fan curves, thermal failsafes, performance profiles, and
-live monitoring — driven from a CLI and a GPUI desktop GUI.
+<p align="center">
+  <img src="docs/img/dashboard.png" alt="Thermite dashboard" width="880">
+</p>
+
+**Thermal and fan management for Linux laptops** — a privileged daemon with
+custom fan curves, layered thermal failsafes, performance profiles, live
+monitoring, and a GPUI desktop GUI + CLI. Built driver-first: each laptop
+family gets a small, honest driver, and the safety policy around it is
+hardware-agnostic.
+
+Thermite never writes to the Embedded Controller, hands control back to the
+firmware when temperatures cross critical limits, and survives firmware
+overrides, suspend/resume, and crashes by design — see
+[Safety](docs/SAFETY.md).
+
+## Screenshots
+
+| Fans & curves | Profiles |
+|---|---|
+| ![Fan control](docs/img/fan-control.png) | ![Profiles](docs/img/profiles.png) |
+
+## Device support
+
+| Device | Status | Via |
+|---|---|---|
+| Acer Nitro V 15 (ANV15-51) | ✅ **fully tested** — independent fan control, curves, profiles | `acer-wmi` (kernel 7.3+) or the [stopgap DKMS module](driver/acer-wmi-anv15/) on 7.2 |
+| Other Acer Nitro / Predator with the acer-wmi gaming quirk | 🔶 should work, untested | same |
+| ASUS laptops | 🔶 driver wanted — see [the driver guide](docs/DRIVERS.md) | — |
+| HP / other vendors | 🔶 driver wanted | — |
+
+Getting a laptop supported is designed to be a small, testable contribution:
+read [`docs/DRIVERS.md`](docs/DRIVERS.md).
+
+## How it works
 
 ```
 crates/
 ├── thermite-core     # pure policy: curves, hysteresis, failsafes, config
-├── thermite-proto    # versioned IPC protocol over a Unix socket
-├── thermite-backend  # acer-wmi sysfs + hwmon + NVML hardware access
+├── thermite-proto    # versioned IPC over a Unix socket (CLI + GUI clients)
+├── thermite-backend  # device drivers (drivers/ registry) + hwmon + NVML
 ├── thermite-daemon   # control loop, failsafes, IPC server (runs as root)
 ├── thermite-cli      # `thermite` command-line client
 └── thermite-gui      # GPUI desktop client
 ```
 
-## Why it looks like this
+- **Fan curves** — per-fan piecewise-linear temperature→duty curves with
+  hysteresis (no fan chatter), duty floors, and battery variants
+  (`balanced-battery` is picked automatically on battery).
+- **Modes** — per fan: firmware auto, fixed manual %, or curve. Manual duty
+  is re-asserted every 2 s so firmware overrides don't stick; drift is
+  detected and alerted.
+- **Failsafes** — warn threshold forces 100% duty; crit threshold hands the
+  fan back to the firmware's own controller and latches until temperatures
+  recover. Curves are validated before use; 0-RPM above configurable temps is
+  impossible.
+- **Suspend/resume** — fans restored to auto before sleep; writes held for a
+  grace window after resume while the EC reinitializes.
+- **Profiles** — platform profiles when the firmware offers them, or full
+  hands-off (`[platform] active = "none"`) to coexist with
+  power-profiles-daemon.
+- **No EC writes, ever.** Full reasoning in
+  [`docs/INVESTIGATION.md`](docs/INVESTIGATION.md) and
+  [`docs/HARDWARE.md`](docs/HARDWARE.md).
 
-The investigation that shaped this architecture is in
-[`docs/INVESTIGATION.md`](docs/INVESTIGATION.md). The short version:
+## Install
 
-- On the ANV15-51, fan control physically lives behind the firmware's WMI
-  gaming interface, not behind EC registers — writing EC RAM is a proven dead
-  end on this model, so Thermite **never writes to the EC**.
-- Mainline `acer-wmi` already speaks that WMI interface (hwmon fans/temps,
-  `pwmX_enable`, `platform_profile`), and the ANV15-51 quirk was accepted
-  upstream in October 2026 (kernel 7.3+). Until then,
-  `modprobe acer_wmi predator_v4=1` gives monitoring + profiles, and the
-  temporary DKMS module in [`driver/`](driver/) enables full control.
-- The reference project (Div-Acer-Manager-Max) showed what to avoid: no
-  failsafes, no suspend handling (resume-storm bugs), fan settings reverted by
-  firmware, a forked 143 KB kernel module. Thermite counters each — see
-  [`docs/SAFETY.md`](docs/SAFETY.md).
+### From source
+
+```sh
+git clone https://github.com/Shanu-Kumawat/Thermite.git
+cd Thermite
+cargo build --release -p thermite-daemon -p thermite-cli -p thermite-gui
+sudo bash scripts/thermite-setup.sh   # service + group + config; idempotent
+# undo: sudo bash scripts/thermite-remove.sh   (--keep-app keeps the app)
+```
+
+The setup script also installs the stopgap DKMS module when your kernel
+predates the in-tree acer-wmi quirk (ANV15-51 on kernel 7.2). Arch users:
+PKGBUILDs are in [`packaging/`](packaging/) (AUR packages planned).
+
+### Check what your machine supports
+
+```sh
+thermite doctor   # driver match, capability level, sensors, profiles — no root needed
+```
 
 ## Quick start
 
 ```sh
-# build
-cargo build --release -p thermite-daemon -p thermite-cli -p thermite-gui
-
-# diagnose what this machine can do right now (no root needed)
-thermite doctor
-
-# one-shot install: stopgap driver (DKMS) + binaries + systemd service
-# + thermite group + verification. Asks for sudo itself.
-sudo bash scripts/thermite-setup.sh
-
-# undo everything (or --keep-app to remove just the driver at kernel 7.3+)
-sudo bash scripts/thermite-remove.sh
+thermite status                  # snapshot: temps, fans, failsafe phase
+thermite monitor                 # live view
+thermite fan list                # fans your driver reports
+thermite fan set cpu curve balanced
+thermite fan set cpu manual 55   # percent duty
+thermite fan set cpu auto        # back to firmware control
+thermite profile list
+thermite-gui                     # desktop app (join the `thermite` group first)
 ```
 
-The manual equivalent of the setup script is in
-[`docs/VERIFICATION.md`](docs/VERIFICATION.md). After it completes:
+Configuration lives at `/etc/thermite/thermite.toml` (strictly validated; see
+[`examples/thermite.toml`](examples/thermite.toml)). Runtime changes made
+from the GUI/CLI persist across daemon restarts.
 
-```sh
-thermite status
-thermite fan cpu curve balanced
-thermite monitor
-thermite-gui   # after logging out and back in once (group membership)
-```
+## Documentation
 
-The GUI (`target/release/thermite-gui`) connects to the same daemon; add your
-user to the `thermite` group first.
+- [`docs/SAFETY.md`](docs/SAFETY.md) — the failsafe design and the things
+  Thermite deliberately never does
+- [`docs/DRIVERS.md`](docs/DRIVERS.md) — adding support for a new laptop
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — crates, IPC, control loop
+- [`docs/HARDWARE.md`](docs/HARDWARE.md) — ANV15-51 findings: WMI vs EC,
+  profile semantics, firmware quirks
+- [`docs/INVESTIGATION.md`](docs/INVESTIGATION.md) — the evidence base
 
-## Safety posture
+## Contributing
 
-- Fans return to **firmware auto** on daemon stop, crash-lapse (re-assert
-  stops → firmware resumes control), suspend, and thermal crit.
-- Duty floors make "0% fan on a hot machine" impossible even with a
-  miswritten curve.
-- Config is strictly validated; a bad config is rejected, never applied.
-- `thermite-daemon --dry-run` runs the whole control loop while logging
-  writes instead of performing them.
-
-Details: [`docs/SAFETY.md`](docs/SAFETY.md).
+Bug reports, new device drivers, and curve/profile experience reports are all
+welcome — see [`CONTRIBUTING.md`](CONTRIBUTING.md). For new laptops,
+[`docs/DRIVERS.md`](docs/DRIVERS.md) walks through probing your hardware and
+writing a driver in ~150 lines, with tests that need no hardware.
 
 ## License
 
-MIT for the application crates. The stopgap kernel module in `driver/` is
-GPL-2.0 (it contains upstream kernel code).
+MIT — see [LICENSE](LICENSE). The stopgap kernel module in
+[`driver/acer-wmi-anv15/`](driver/acer-wmi-anv15/) is a patched copy of
+GPL-2.0 kernel source and remains GPL-2.0-only.
