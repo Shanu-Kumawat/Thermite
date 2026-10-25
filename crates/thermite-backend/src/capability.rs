@@ -1,4 +1,5 @@
-//! Capability probing for the acer-wmi gaming interface.
+//! Capability probing for the acer-wmi driver (invoked from
+//! [`crate::drivers::acer_wmi`]).
 //!
 //! Three states matter on an ANV15-51 (kernel 7.2, BIOS V1.60):
 //!
@@ -11,26 +12,9 @@
 //! `Full` arrives with kernel ≥ 7.3 (upstream ANV15-51 quirk) or the
 //! stopgap DKMS module from this repo.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use thermite_core::{CapabilityLevel, CapabilityReport};
-
-/// hwmon names the acer-wmi driver registers under. Mainline (v7.2 and
-/// pdx86 for-next) registers plain `"acer"`; `"acer_wmi"` is kept for
-/// community builds that rename it.
-pub const ACER_WMI_HWMON_NAMES: [&str; 2] = ["acer", "acer_wmi"];
-
-/// True when a hwmon name belongs to the acer-wmi driver.
-pub fn is_acer_hwmon_name(name: &str) -> bool {
-    ACER_WMI_HWMON_NAMES.contains(&name)
-}
-
-/// Locate the acer-wmi hwmon directory under `root`, if present.
-pub fn find_acer_hwmon(root: &Path) -> Option<PathBuf> {
-    crate::sysfs::hwmon_dirs(root)
-        .into_iter()
-        .find(|d| crate::sysfs::hwmon_name(d).is_some_and(|n| is_acer_hwmon_name(&n)))
-}
 
 /// Platform profile choices from
 /// `root/sys/firmware/acpi/platform_profile_choices`.
@@ -46,9 +30,10 @@ pub fn probe(root: &Path) -> CapabilityReport {
         ..CapabilityReport::default()
     };
 
-    match find_acer_hwmon(root) {
+    match super::drivers::acer_wmi::find_acer_hwmon(root) {
         Some(hwmon) => {
-            report.acer_wmi_hwmon = Some(hwmon.display().to_string());
+            report.driver = Some("acer-wmi".to_string());
+            report.driver_detail = Some(hwmon.display().to_string());
             let fans = hwmon.join("fan1_input").exists();
             let pwm = hwmon.join("pwm1_enable").exists();
             if fans && pwm {

@@ -20,7 +20,7 @@ pub fn scan_temps_under(root: &Path) -> Result<Vec<TempTelemetry>, BackendError>
         let Some(name) = crate::sysfs::hwmon_name(&dir) else {
             continue;
         };
-        if crate::capability::is_acer_hwmon_name(&name) {
+        if crate::drivers::acer_wmi::is_acer_hwmon_name(&name) {
             continue; // classified separately by AcerWmiBackend
         }
         let class = classify(&name);

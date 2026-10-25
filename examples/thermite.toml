@@ -32,12 +32,16 @@ drop_c = 2.0        # after an upshift, temps must fall this far before a
                     # downshift is considered
 hold_ticks = 5      # a lower duty must persist this many ticks to commit
 
-[fans.cpu]
+# One section per fan, keyed by the driver-reported fan name (`thermite fan
+# list` shows them). Fans present on the machine but absent here default to
+# auto. Names below are the acer-wmi driver's ("cpu", "gpu"); other drivers
+# may report more or differently named fans.
+[fans."cpu"]
 mode = "auto"       # "auto" | "manual" | "curve"
 # curve = "balanced"          # when mode = "curve"
 # manual_duty_pct = 40        # when mode = "manual"
 
-[fans.gpu]
+[fans."gpu"]
 mode = "auto"
 
 [platform]
