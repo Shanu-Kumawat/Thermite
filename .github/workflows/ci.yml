@@ -19,8 +19,9 @@ jobs:
       - name: Install GUI build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxkbcommon-dev libwayland-dev libgtk-3-dev \
-            libpulse-dev libasound2-dev libdbus-1-dev libssl-dev
+          sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev libgtk-3-dev libpulse-dev libasound2-dev \
+            libdbus-1-dev libssl-dev
       - uses: Swatinem/rust-cache@v2
       - name: Format
         run: cargo fmt --all --check
