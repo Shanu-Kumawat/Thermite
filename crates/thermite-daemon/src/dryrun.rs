@@ -6,7 +6,9 @@
 use std::collections::BTreeMap;
 
 use thermite_core::BackendError;
-use thermite_core::sensors::{Backend, CapabilityReport, FanId, HwFanMode, Telemetry};
+use thermite_core::sensors::{
+    Backend, CapabilityReport, FanDescriptor, FanId, HwFanMode, Telemetry,
+};
 
 /// Wraps a backend and suppresses its writes.
 pub struct DryRunBackend {
@@ -34,6 +36,10 @@ impl DryRunBackend {
 }
 
 impl Backend for DryRunBackend {
+    fn fans(&self) -> &[FanDescriptor] {
+        self.inner.fans()
+    }
+
     fn capability(&self) -> CapabilityReport {
         self.inner.capability()
     }
@@ -42,9 +48,9 @@ impl Backend for DryRunBackend {
         let mut telemetry = self.inner.read_telemetry()?;
         // Simulate our writes in the readback so drift detection sees a
         // coherent world.
-        for fan in FanId::all() {
-            if let Some((mode, duty)) = self.shadow.get(&fan)
-                && let Some(slot) = telemetry.fans.iter_mut().find(|f| f.id == fan)
+        for fan in self.inner.fans().to_vec() {
+            if let Some((mode, duty)) = self.shadow.get(&fan.id)
+                && let Some(slot) = telemetry.fans.iter_mut().find(|f| f.id == fan.id)
             {
                 slot.hw_mode = Some(*mode);
                 slot.duty_pct = Some(*duty);
@@ -56,19 +62,19 @@ impl Backend for DryRunBackend {
         Ok(telemetry)
     }
 
-    fn set_fan_hw_mode(&mut self, fan: FanId, mode: HwFanMode) -> Result<(), BackendError> {
+    fn set_fan_hw_mode(&mut self, fan: &FanId, mode: HwFanMode) -> Result<(), BackendError> {
         self.suppressed += 1;
-        let entry = self.shadow.entry(fan).or_insert((mode, 0));
+        let entry = self.shadow.entry(fan.clone()).or_insert((mode, 0));
         entry.0 = mode;
         tracing::info!("[dry-run] set {fan} fan mode -> {mode:?}");
         Ok(())
     }
 
-    fn set_fan_duty(&mut self, fan: FanId, duty_pct: u8) -> Result<(), BackendError> {
+    fn set_fan_duty(&mut self, fan: &FanId, duty_pct: u8) -> Result<(), BackendError> {
         self.suppressed += 1;
         let entry = self
             .shadow
-            .entry(fan)
+            .entry(fan.clone())
             .or_insert((HwFanMode::Custom, duty_pct));
         entry.1 = duty_pct;
         tracing::info!("[dry-run] set {fan} fan duty -> {duty_pct}%");

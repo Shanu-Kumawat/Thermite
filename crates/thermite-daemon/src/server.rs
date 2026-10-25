@@ -444,6 +444,7 @@ pub fn tick_frame(telemetry: thermite_core::Telemetry, control: ControlSnapshot)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use thermite_core::Backend as _;
     use thermite_core::CapabilityReport;
     use thermite_core::curve::CurvePoint;
     use thermite_core::sensors::CapabilityLevel;
@@ -454,8 +455,9 @@ mod tests {
             thermite_core::Config::with_default_curves(),
             &PersistedState::default(),
             false,
+            thermite_backend::FakeBackend::new().fans().to_vec(),
         );
-        st.config.platform.active = Some(thermite_core::PlatformProfile::Balanced);
+        st.config.platform.active = Some(thermite_core::PlatformProfile::new("balanced"));
         st.capability = CapabilityReport {
             level: CapabilityLevel::Full,
             platform_profiles: vec!["quiet".into(), "balanced".into()],
@@ -496,7 +498,7 @@ mod tests {
         // Set fan mode to a curve; state must persist.
         client
             .call(Request::SetFanConfig {
-                fan: thermite_core::FanId::Cpu,
+                fan: thermite_core::FanId::new("cpu"),
                 config: thermite_core::config::FanConfig {
                     mode: FanModeKind::Curve,
                     curve: Some("balanced".into()),
@@ -513,7 +515,7 @@ mod tests {
         // Bad curve reference rejected.
         let err = client
             .call(Request::SetFanConfig {
-                fan: thermite_core::FanId::Cpu,
+                fan: thermite_core::FanId::new("cpu"),
                 config: thermite_core::config::FanConfig {
                     mode: FanModeKind::Curve,
                     curve: Some("nope".into()),

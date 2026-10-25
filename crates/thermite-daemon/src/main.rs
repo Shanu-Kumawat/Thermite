@@ -96,8 +96,8 @@ fn main() -> Result<()> {
     };
     let capability = backend.capability();
     info!(
-        "hardware capability: {:?} (hwmon: {:?}, profiles: {:?})",
-        capability.level, capability.acer_wmi_hwmon, capability.platform_profiles
+        "hardware capability: {:?} (driver: {:?}, profiles: {:?})",
+        capability.level, capability.driver, capability.platform_profiles
     );
     for note in &capability.notes {
         info!("capability: {note}");
@@ -113,6 +113,7 @@ fn main() -> Result<()> {
         config,
         &persisted,
         args.dry_run,
+        backend.fans().to_vec(),
     )));
     shared
         .lock()

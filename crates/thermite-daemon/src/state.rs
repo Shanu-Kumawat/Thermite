@@ -14,7 +14,7 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use thermite_core::FailsafePhase;
 use thermite_core::config::{Config, FanConfig};
-use thermite_core::sensors::{CapabilityReport, Telemetry};
+use thermite_core::sensors::{CapabilityReport, FanDescriptor, FanId, Telemetry};
 use thermite_proto::{Alert, ControlSnapshot, FanRuntimeState};
 
 /// Mutable per-fan runtime state (desired config + last observed effects).
@@ -70,22 +70,33 @@ pub fn save_persisted(dir: &Path, state: &PersistedState) -> anyhow::Result<()> 
     Ok(())
 }
 
-/// Effective per-fan desired config: persisted state overlays config-file
-/// defaults.
-pub fn effective_fans(config: &Config, persisted: &PersistedState) -> BTreeMap<String, FanConfig> {
-    let mut fans = BTreeMap::new();
-    fans.insert("cpu".to_string(), config.fans.cpu.clone());
-    fans.insert("gpu".to_string(), config.fans.gpu.clone());
-    for (fan, cfg) in &persisted.fans {
-        fans.insert(fan.clone(), cfg.clone());
+/// Effective per-fan desired config: for each fan the driver reports, start
+/// from the config-file entry (or auto when absent), then overlay persisted
+/// runtime selections.
+pub fn effective_fans(
+    config: &Config,
+    persisted: &PersistedState,
+    fans: &[FanDescriptor],
+) -> BTreeMap<String, FanConfig> {
+    let mut out = BTreeMap::new();
+    for d in fans {
+        out.insert(
+            d.id.to_string(),
+            config.fans.get(d.id.as_str()).cloned().unwrap_or_default(),
+        );
     }
-    fans
+    for (fan, cfg) in &persisted.fans {
+        out.insert(fan.clone(), cfg.clone());
+    }
+    out
 }
 
 /// Everything the IPC server and control loop share.
 pub struct SharedState {
     /// Current policy configuration (SIGHUP reloads it).
     pub config: Config,
+    /// Fans the driver reported (stable order; drives iteration).
+    pub fan_descriptors: Vec<FanDescriptor>,
     /// Per-fan desired + observed state, keyed by fan name string.
     pub fans: BTreeMap<String, FanRuntime>,
     /// Desired platform profile (applies at startup, on change, after resume).
@@ -118,9 +129,15 @@ pub struct SharedState {
 }
 
 impl SharedState {
-    /// Assemble initial state from config + persisted selections.
-    pub fn new(config: Config, persisted: &PersistedState, dry_run: bool) -> Self {
-        let fans = effective_fans(&config, persisted)
+    /// Assemble initial state from config + persisted selections + the
+    /// driver-reported fan list.
+    pub fn new(
+        config: Config,
+        persisted: &PersistedState,
+        dry_run: bool,
+        fan_descriptors: Vec<FanDescriptor>,
+    ) -> Self {
+        let fans = effective_fans(&config, persisted, &fan_descriptors)
             .into_iter()
             .map(|(fan, config)| {
                 (
@@ -136,17 +153,16 @@ impl SharedState {
         // owns profiles); otherwise the config default applies, overridden
         // by the user's persisted runtime choice. Both are normalized to
         // canonical sysfs names.
-        let desired_profile = match config.platform.active {
+        let desired_profile = match &config.platform.active {
             None => None,
             Some(default) => persisted
                 .platform_profile
-                .as_deref()
-                .and_then(thermite_core::PlatformProfile::parse)
-                .or(Some(default))
-                .map(|p| p.as_str().to_string()),
+                .clone()
+                .or_else(|| Some(default.as_str().to_string())),
         };
         Self {
             config,
+            fan_descriptors,
             fans,
             desired_profile,
             profile_applied: false,
@@ -180,11 +196,7 @@ impl SharedState {
                 .fans
                 .iter()
                 .map(|(fan, rt)| FanRuntimeState {
-                    id: if fan == "cpu" {
-                        thermite_core::FanId::Cpu
-                    } else {
-                        thermite_core::FanId::Gpu
-                    },
+                    id: FanId::new(fan),
                     config: rt.config.clone(),
                     resolved_curve: rt.resolved_curve.clone(),
                     commanded_duty: rt.commanded_duty,

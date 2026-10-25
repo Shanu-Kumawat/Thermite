@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use thermite_core::config::{Config, FanModeKind};
-use thermite_core::sensors::{Backend, FanId, HwFanMode};
+use thermite_core::sensors::{Backend, FanDescriptor, FanId, HwFanMode};
 use thermite_core::{FailsafeEngine, FailsafePhase, Hysteresis, PhaseDirective};
 use thermite_proto::{AlertKind, AlertLevel};
 use tracing::{debug, info, warn};
@@ -80,7 +80,7 @@ impl ControlLoop {
         paths: DaemonPaths,
         notify: bool,
     ) -> Self {
-        let (thresholds, drop_c, hold_ticks) = {
+        let (thresholds, drop_c, hold_ticks, fan_names) = {
             let Ok(guard) = shared.lock() else {
                 unreachable!("shared state lock at startup");
             };
@@ -88,11 +88,16 @@ impl ControlLoop {
                 guard.config.failsafe,
                 guard.config.hysteresis.drop_c,
                 guard.config.hysteresis.hold_ticks,
+                guard
+                    .fan_descriptors
+                    .iter()
+                    .map(|d| d.id.to_string())
+                    .collect::<Vec<_>>(),
             )
         };
-        let hysteresis = ["cpu", "gpu"]
+        let hysteresis = fan_names
             .into_iter()
-            .map(|fan| (fan.to_string(), Hysteresis::new(drop_c, hold_ticks)))
+            .map(|fan| (fan, Hysteresis::new(drop_c, hold_ticks)))
             .collect();
         Self {
             backend,
@@ -365,8 +370,13 @@ impl ControlLoop {
             reassert_ms,
         };
         let config_gen = self.shared.lock().map(|g| g.config_gen).unwrap_or(0);
-        for fan_id in FanId::all() {
-            let name = fan_id.to_string();
+        let fan_list: Vec<FanDescriptor> = self
+            .shared
+            .lock()
+            .map(|g| g.fan_descriptors.clone())
+            .unwrap_or_default();
+        for fan in fan_list {
+            let name = fan.id.to_string();
             let Some(config) = fan_configs
                 .iter()
                 .find(|(n, _)| n == &name)
@@ -374,10 +384,7 @@ impl ControlLoop {
             else {
                 continue;
             };
-            let driving_temp = match fan_id {
-                FanId::Cpu => cpu_t.unwrap_or(0.0),
-                FanId::Gpu => gpu_t.unwrap_or(0.0),
-            };
+            let driving_temp = telemetry.temp_for(&fan.temp_source).unwrap_or(0.0);
 
             // A changed mode/curve/config means the hysteresis state (and
             // possibly the last write) reflect the OLD policy — reset both
@@ -400,19 +407,19 @@ impl ControlLoop {
 
             match directive {
                 PhaseDirective::ReleaseToAuto => {
-                    self.ensure_auto(&name, fan_id, ctx);
+                    self.ensure_auto(&name, &fan.id, ctx);
                 }
                 PhaseDirective::ForceFull => {
-                    self.apply_fan(&name, fan_id, HwFanMode::Custom, 100, ctx);
+                    self.apply_fan(&name, &fan.id, HwFanMode::Custom, 100, ctx);
                 }
                 PhaseDirective::Normal => match config.mode {
                     FanModeKind::Auto => {
-                        self.ensure_auto(&name, fan_id, ctx);
+                        self.ensure_auto(&name, &fan.id, ctx);
                     }
                     FanModeKind::Manual => {
                         let duty = config.manual_duty_pct.unwrap_or(40);
                         let duty = self.failsafe.apply_floors(duty, driving_temp);
-                        self.apply_fan(&name, fan_id, HwFanMode::Custom, duty, ctx);
+                        self.apply_fan(&name, &fan.id, HwFanMode::Custom, duty, ctx);
                     }
                     FanModeKind::Curve => {
                         let curve_name = config.curve.clone().unwrap_or_default();
@@ -433,14 +440,14 @@ impl ControlLoop {
                                     .map(|h| h.update(driving_temp, &curve))
                                     .unwrap_or(0);
                                 let duty = self.failsafe.apply_floors(raw, driving_temp);
-                                self.apply_fan(&name, fan_id, HwFanMode::Custom, duty, ctx);
+                                self.apply_fan(&name, &fan.id, HwFanMode::Custom, duty, ctx);
                             }
                             None => {
                                 self.set_fan_error(
                                     &name,
                                     format!("curve \"{curve_name}\" missing"),
                                 );
-                                self.ensure_auto(&name, fan_id, ctx);
+                                self.ensure_auto(&name, &fan.id, ctx);
                             }
                         }
                     }
@@ -456,7 +463,7 @@ impl ControlLoop {
     fn apply_fan(
         &mut self,
         name: &str,
-        fan: FanId,
+        fan: &FanId,
         mode: HwFanMode,
         duty: u8,
         ctx: TickContext<'_>,
@@ -549,7 +556,7 @@ impl ControlLoop {
     }
 
     /// Ensure a fan is in firmware-auto mode.
-    fn ensure_auto(&mut self, name: &str, fan: FanId, ctx: TickContext<'_>) {
+    fn ensure_auto(&mut self, name: &str, fan: &FanId, ctx: TickContext<'_>) {
         let TickContext {
             telemetry,
             now,
@@ -609,11 +616,11 @@ impl ControlLoop {
 
     /// Restore firmware-auto on every fan we may have touched.
     pub fn restore_auto(&mut self) {
-        for fan in FanId::all() {
-            if let Err(e) = self.backend.set_fan_hw_mode(fan, HwFanMode::Auto) {
-                warn!("could not restore auto for {fan} fan: {e}");
+        for fan in self.backend.fans().to_vec() {
+            if let Err(e) = self.backend.set_fan_hw_mode(&fan.id, HwFanMode::Auto) {
+                warn!("could not restore auto for {} fan: {e}", fan.id);
             } else {
-                info!("restored firmware auto for {fan} fan");
+                info!("restored firmware auto for {} fan", fan.id);
             }
         }
         self.restored_auto = true;
@@ -691,18 +698,25 @@ mod tests {
     /// Backend>`.
     struct ScriptedBackend {
         fake: Arc<Mutex<FakeBackend>>,
+        fans: Vec<FanDescriptor>,
         cpu: Arc<Mutex<f32>>,
         gpu: Arc<Mutex<f32>>,
     }
 
     impl ScriptedBackend {
         fn new() -> (Self, FakeHandle, TempHandle, TempHandle) {
-            let fake = Arc::new(Mutex::new(FakeBackend::new()));
+            Self::with_fake(FakeBackend::new())
+        }
+
+        fn with_fake(fake_backend: FakeBackend) -> (Self, FakeHandle, TempHandle, TempHandle) {
+            let fake = Arc::new(Mutex::new(fake_backend));
+            let fans = fake.lock().map(|f| f.fans().to_vec()).unwrap_or_default();
             let cpu = Arc::new(Mutex::new(55.0));
             let gpu = Arc::new(Mutex::new(45.0));
             (
                 Self {
                     fake: Arc::clone(&fake),
+                    fans,
                     cpu: Arc::clone(&cpu),
                     gpu: Arc::clone(&gpu),
                 },
@@ -714,6 +728,9 @@ mod tests {
     }
 
     impl Backend for ScriptedBackend {
+        fn fans(&self) -> &[FanDescriptor] {
+            &self.fans
+        }
         fn capability(&self) -> thermite_core::CapabilityReport {
             self.fake.lock().map(|f| f.capability()).unwrap_or_default()
         }
@@ -731,7 +748,7 @@ mod tests {
         }
         fn set_fan_hw_mode(
             &mut self,
-            fan: FanId,
+            fan: &FanId,
             mode: HwFanMode,
         ) -> Result<(), thermite_core::BackendError> {
             self.fake
@@ -741,7 +758,7 @@ mod tests {
         }
         fn set_fan_duty(
             &mut self,
-            fan: FanId,
+            fan: &FanId,
             duty: u8,
         ) -> Result<(), thermite_core::BackendError> {
             self.fake
@@ -773,10 +790,12 @@ mod tests {
     ) {
         let (backend, fake, cpu, gpu) = ScriptedBackend::new();
         let config = Config::with_default_curves();
+        let fan_descriptors = backend.fans.clone();
         let shared = Arc::new(Mutex::new(SharedState::new(
             config,
             &crate::state::PersistedState::default(),
             false,
+            fan_descriptors,
         )));
         let subs = Arc::new(Subscribers::default());
         let paths = DaemonPaths {
@@ -827,6 +846,65 @@ mod tests {
     }
 
     #[test]
+    fn third_fan_driven_by_named_temp_source() {
+        // N-fan generalization: an "intake" fan driven by a named sensor
+        // must be controlled with that sensor's temperature.
+        let mut fb = FakeBackend::with_fans(&[
+            ("cpu", "CPU Fan", thermite_core::TempSource::Cpu),
+            ("gpu", "GPU Fan", thermite_core::TempSource::Gpu),
+            (
+                "intake",
+                "Intake Fan",
+                thermite_core::TempSource::Named("Board".into()),
+            ),
+        ]);
+        let mut t = fb.read_telemetry().unwrap();
+        t.temps.push(thermite_core::TempTelemetry {
+            label: "Board".into(),
+            class: thermite_core::TempClass::Board,
+            temp_c: 70.0,
+        });
+        fb.set_telemetry(t);
+        let (backend, fake, cpu, gpu) = ScriptedBackend::with_fake(fb);
+
+        let config = Config::with_default_curves();
+        let fan_descriptors = backend.fans.clone();
+        let shared = Arc::new(Mutex::new(SharedState::new(
+            config,
+            &crate::state::PersistedState::default(),
+            false,
+            fan_descriptors,
+        )));
+        assert_eq!(shared.lock().unwrap().fans.len(), 3);
+        set_fan_mode(&shared, "intake", curve_mode("balanced"));
+        let subs = Arc::new(Subscribers::default());
+        let mut control = ControlLoop::new(
+            Box::new(backend),
+            Arc::clone(&shared),
+            subs,
+            DaemonPaths {
+                config: PathBuf::from("/nonexistent/thermite.toml"),
+                socket: PathBuf::from("/nonexistent/t.sock"),
+                state_dir: std::env::temp_dir(),
+            },
+            false,
+        );
+        control.tick_once(Instant::now());
+        // Board 70°C on the balanced curve -> 60% duty, written to the
+        // intake fan (not cpu/gpu).
+        let writes = ops(&fake, FanId::new("intake"));
+        assert!(
+            writes.contains(&WriteOp::Duty {
+                fan: FanId::new("intake"),
+                duty_pct: 60
+            }),
+            "intake writes: {writes:?}"
+        );
+        assert!(ops(&fake, FanId::new("cpu")).is_empty());
+        drop((cpu, gpu));
+    }
+
+    #[test]
     fn curve_following_with_reassert() {
         let (mut control, shared, _subs, fake, _cpu_t, _gpu_t) = setup();
         set_fan_mode(&shared, "cpu", curve_mode("balanced"));
@@ -834,30 +912,30 @@ mod tests {
 
         control.tick_once(t0);
         // FakeBackend defaults: cpu 55°C -> balanced curve duty 55%.
-        let writes = ops(&fake, FanId::Cpu);
+        let writes = ops(&fake, FanId::new("cpu"));
         assert_eq!(
             writes,
             vec![
                 WriteOp::Mode {
-                    fan: FanId::Cpu,
+                    fan: FanId::new("cpu"),
                     mode: HwFanMode::Custom
                 },
                 WriteOp::Duty {
-                    fan: FanId::Cpu,
+                    fan: FanId::new("cpu"),
                     duty_pct: 55
                 },
             ]
         );
         // GPU stays in firmware auto: no writes.
-        assert!(ops(&fake, FanId::Gpu).is_empty());
+        assert!(ops(&fake, FanId::new("gpu")).is_empty());
 
         // Unchanged state: no writes before the re-assert deadline.
         control.tick_once(t0 + Duration::from_millis(1500));
-        assert_eq!(ops(&fake, FanId::Cpu).len(), 2);
+        assert_eq!(ops(&fake, FanId::new("cpu")).len(), 2);
 
         // Re-assert deadline passes (2000ms): mode+duty written again.
         control.tick_once(t0 + Duration::from_millis(3100));
-        assert_eq!(ops(&fake, FanId::Cpu).len(), 4);
+        assert_eq!(ops(&fake, FanId::new("cpu")).len(), 4);
     }
 
     #[test]
@@ -875,9 +953,9 @@ mod tests {
             },
         );
         control.tick_once(Instant::now());
-        let writes = ops(&fake, FanId::Cpu);
+        let writes = ops(&fake, FanId::new("cpu"));
         assert!(writes.contains(&WriteOp::Duty {
-            fan: FanId::Cpu,
+            fan: FanId::new("cpu"),
             duty_pct: 30
         }));
     }
@@ -896,11 +974,11 @@ mod tests {
         set_fan_mode(&shared, "cpu", curve_mode("flat-zero"));
         control.tick_once(Instant::now());
         assert!(
-            ops(&fake, FanId::Cpu)
+            ops(&fake, FanId::new("cpu"))
                 .iter()
                 .any(|op| matches!(op, WriteOp::Duty { duty_pct: 15, .. })),
             "expected min-spin duty 15, got {:?}",
-            ops(&fake, FanId::Cpu)
+            ops(&fake, FanId::new("cpu"))
         );
     }
 
@@ -916,10 +994,10 @@ mod tests {
         *cpu_t.lock().unwrap() = 88.0;
         *gpu_t.lock().unwrap() = 50.0;
         control.tick_once(t + Duration::from_secs(1));
-        let writes = ops(&fake, FanId::Cpu);
+        let writes = ops(&fake, FanId::new("cpu"));
         assert!(
             writes.contains(&WriteOp::Duty {
-                fan: FanId::Cpu,
+                fan: FanId::new("cpu"),
                 duty_pct: 100
             }),
             "expected full duty at warn, got {writes:?}"
@@ -929,10 +1007,10 @@ mod tests {
         // Crit threshold (cpu 92): release to firmware auto.
         *cpu_t.lock().unwrap() = 93.0;
         control.tick_once(t + Duration::from_secs(2));
-        let writes = ops(&fake, FanId::Cpu);
+        let writes = ops(&fake, FanId::new("cpu"));
         assert!(
             writes.contains(&WriteOp::Mode {
-                fan: FanId::Cpu,
+                fan: FanId::new("cpu"),
                 mode: HwFanMode::Auto
             }),
             "expected auto write at crit, got {writes:?}"
@@ -943,11 +1021,11 @@ mod tests {
         ));
 
         // Still latched at 90 (crit 92 - recovery 5 = 87).
-        let before = ops(&fake, FanId::Cpu).len();
+        let before = ops(&fake, FanId::new("cpu")).len();
         *cpu_t.lock().unwrap() = 90.0;
         control.tick_once(t + Duration::from_secs(3));
         assert_eq!(
-            ops(&fake, FanId::Cpu).len(),
+            ops(&fake, FanId::new("cpu")).len(),
             before,
             "no duty writes while latched"
         );
@@ -956,10 +1034,10 @@ mod tests {
         *cpu_t.lock().unwrap() = 85.0;
         control.tick_once(t + Duration::from_secs(4));
         assert!(matches!(control.failsafe.phase(), FailsafePhase::Normal));
-        let tail = ops(&fake, FanId::Cpu);
+        let tail = ops(&fake, FanId::new("cpu"));
         assert!(
             tail.contains(&WriteOp::Mode {
-                fan: FanId::Cpu,
+                fan: FanId::new("cpu"),
                 mode: HwFanMode::Custom
             }),
             "expected manual control restored, got {tail:?}"
@@ -984,28 +1062,28 @@ mod tests {
         set_fan_mode(&shared, "cpu", curve_mode("balanced"));
         let t = Instant::now();
         control.tick_once(t);
-        assert_eq!(ops(&fake, FanId::Cpu).len(), 2);
+        assert_eq!(ops(&fake, FanId::new("cpu")).len(), 2);
 
         control.handle_suspend(SuspendEvent::Sleeping, t + Duration::from_secs(10));
-        let writes = ops(&fake, FanId::Cpu);
+        let writes = ops(&fake, FanId::new("cpu"));
         assert!(writes.contains(&WriteOp::Mode {
-            fan: FanId::Cpu,
+            fan: FanId::new("cpu"),
             mode: HwFanMode::Auto
         }));
 
         control.handle_suspend(SuspendEvent::Resumed, t + Duration::from_secs(30));
-        let baseline = ops(&fake, FanId::Cpu).len();
+        let baseline = ops(&fake, FanId::new("cpu")).len();
 
         // Inside the 20s grace: telemetry flows, writes do not.
         control.tick_once(t + Duration::from_secs(35));
-        assert_eq!(ops(&fake, FanId::Cpu).len(), baseline);
+        assert_eq!(ops(&fake, FanId::new("cpu")).len(), baseline);
 
         // Grace over: state re-applied.
         control.tick_once(t + Duration::from_secs(55));
-        assert!(ops(&fake, FanId::Cpu).len() > baseline);
-        let tail = ops(&fake, FanId::Cpu);
+        assert!(ops(&fake, FanId::new("cpu")).len() > baseline);
+        let tail = ops(&fake, FanId::new("cpu"));
         assert!(tail.contains(&WriteOp::Mode {
-            fan: FanId::Cpu,
+            fan: FanId::new("cpu"),
             mode: HwFanMode::Custom
         }));
     }
@@ -1021,7 +1099,7 @@ mod tests {
         // override every tick to simulate a persistent interferer.
         let hijack = |fake: &Arc<Mutex<FakeBackend>>| {
             fake.lock().unwrap().set_fan_readback(
-                FanId::Cpu,
+                &FanId::new("cpu"),
                 Some(800),
                 Some(0),
                 Some(HwFanMode::Auto),
@@ -1054,9 +1132,9 @@ mod tests {
         assert_eq!(count, 1, "cooldown should suppress duplicate alerts");
 
         // And the control loop wrote the correction (mode back to custom).
-        let writes = ops(&fake, FanId::Cpu);
+        let writes = ops(&fake, FanId::new("cpu"));
         assert!(writes.contains(&WriteOp::Mode {
-            fan: FanId::Cpu,
+            fan: FanId::new("cpu"),
             mode: HwFanMode::Custom
         }));
     }
@@ -1109,15 +1187,15 @@ mod tests {
         control.tick_once(Instant::now());
         shared.lock().unwrap().shutting_down = true;
         control.tick_once(Instant::now() + Duration::from_secs(1));
-        let writes = ops(&fake, FanId::Cpu);
+        let writes = ops(&fake, FanId::new("cpu"));
         assert!(writes.contains(&WriteOp::Mode {
-            fan: FanId::Cpu,
+            fan: FanId::new("cpu"),
             mode: HwFanMode::Auto
         }));
         let baseline = writes.len();
         control.tick_once(Instant::now() + Duration::from_secs(2));
         assert_eq!(
-            ops(&fake, FanId::Cpu).len(),
+            ops(&fake, FanId::new("cpu")).len(),
             baseline,
             "no further writes after shutdown restore"
         );
@@ -1135,7 +1213,7 @@ mod tests {
 
         // Raise the temp so hysteresis records a high upshift (~60%).
         control.tick_once(t + Duration::from_secs(1));
-        let before = ops(&fake, FanId::Cpu)
+        let before = ops(&fake, FanId::new("cpu"))
             .iter()
             .filter_map(|op| match op {
                 WriteOp::Duty { duty_pct, .. } => Some(*duty_pct),
@@ -1159,7 +1237,7 @@ mod tests {
         }
         control.tick_once(t + Duration::from_secs(2));
 
-        let duties: Vec<u8> = ops(&fake, FanId::Cpu)
+        let duties: Vec<u8> = ops(&fake, FanId::new("cpu"))
             .iter()
             .filter_map(|op| match op {
                 WriteOp::Duty { duty_pct, .. } => Some(*duty_pct),
@@ -1198,7 +1276,7 @@ mod tests {
         }
         set_fan_mode(&shared, "cpu", curve_mode("low"));
         control.tick_once(t + Duration::from_secs(1));
-        let duties: Vec<u8> = ops(&fake, FanId::Cpu)
+        let duties: Vec<u8> = ops(&fake, FanId::new("cpu"))
             .iter()
             .filter_map(|op| match op {
                 WriteOp::Duty { duty_pct, .. } => Some(*duty_pct),

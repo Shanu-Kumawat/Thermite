@@ -24,7 +24,7 @@ use thermite_core::{
 use thiserror::Error;
 
 /// Protocol version; bump on any incompatible wire change.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 /// Default daemon socket path (owned by root, group-readable).
 pub const DEFAULT_SOCKET_PATH: &str = "/run/thermite/thermite.sock";
 /// Largest frame accepted; telemetry frames are ~1-2 KiB, configs a few KiB.
