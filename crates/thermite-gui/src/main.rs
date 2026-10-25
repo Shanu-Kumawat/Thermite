@@ -2074,6 +2074,13 @@ impl ThermiteApp {
                 let name = name.to_string();
                 move |this, _ev: &ClickEvent, _window, cx| {
                     this.selected_profile = Some(name.clone());
+                    // The whole row applies the profile (when Thermite owns
+                    // profiles); otherwise the click just selects it.
+                    if this.config.platform.active.is_some() {
+                        this.send(GuiCommand::SetProfile {
+                            profile: name.clone(),
+                        });
+                    }
                     cx.notify();
                 }
             }))
@@ -2122,26 +2129,9 @@ impl ThermiteApp {
                     .when(!is_active && manages, |this| {
                         this.child(
                             div()
-                                .id(SharedString::new(format!("profile-apply-{name}")))
-                                .px_4()
-                                .py_1p5()
-                                .rounded_md()
-                                .border_1()
-                                .border_color(BORDER)
                                 .text_xs()
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(TEXT)
-                                .hover(|this| this.bg(ACCENT).border_color(ACCENT))
-                                .on_click(cx.listener({
-                                    let name = name.to_string();
-                                    move |this, _ev: &ClickEvent, _window, cx| {
-                                        this.send(GuiCommand::SetProfile {
-                                            profile: name.clone(),
-                                        });
-                                        cx.notify();
-                                    }
-                                }))
-                                .child("Apply"),
+                                .text_color(TEXT_FAINT)
+                                .child("click to apply"),
                         )
                     }),
             )

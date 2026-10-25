@@ -305,6 +305,7 @@ fn handle_request(
             validate_runtime_fans(&new_config, &guard.fans)?;
             write_config(&new_config, &paths.config).map_err(|e| e.to_string())?;
             guard.config = new_config;
+            guard.config_gen += 1;
             let _ = persist_state(&guard, &paths.state_dir);
             subs.broadcast(&Frame::Event(Event::ConfigChanged {
                 config: guard.config.clone(),
@@ -324,6 +325,7 @@ fn handle_request(
             validate_runtime_fans(&new_config, &guard.fans)?;
             write_config(&new_config, &paths.config).map_err(|e| e.to_string())?;
             guard.config = new_config;
+            guard.config_gen += 1;
             let _ = persist_state(&guard, &paths.state_dir);
             subs.broadcast(&Frame::Event(Event::ConfigChanged {
                 config: guard.config.clone(),

@@ -112,6 +112,9 @@ pub struct SharedState {
     pub dry_run_writes: u64,
     /// Hardware capability summary (set once at startup).
     pub capability: CapabilityReport,
+    /// Bumped whenever the policy config changes (curve edits, reloads);
+    /// the control loop uses it to detect edits and re-evaluate fresh.
+    pub config_gen: u64,
 }
 
 impl SharedState {
@@ -157,6 +160,7 @@ impl SharedState {
             dry_run,
             dry_run_writes: 0,
             capability: CapabilityReport::default(),
+            config_gen: 0,
         }
     }
 

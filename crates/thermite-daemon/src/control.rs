@@ -60,6 +60,11 @@ pub struct ControlLoop {
     failsafe: FailsafeEngine,
     hysteresis: BTreeMap<String, Hysteresis>,
     last_written: BTreeMap<String, LastWrite>,
+    /// Per-fan (mode, curve, config generation) — when it changes, the
+    /// fan's hysteresis is stale (built against the old policy) and gets
+    /// reset so edits apply immediately instead of being gated by old
+    /// upshift points.
+    fan_sig: BTreeMap<String, (u8, Option<String>, u64)>,
     last_drift_alert: BTreeMap<String, Option<Instant>>,
     last_telemetry_error: Option<Instant>,
     tick_ms: u64,
@@ -98,6 +103,7 @@ impl ControlLoop {
             failsafe: FailsafeEngine::new(thresholds),
             hysteresis,
             last_written: BTreeMap::new(),
+            fan_sig: BTreeMap::new(),
             last_drift_alert: BTreeMap::new(),
             last_telemetry_error: None,
             tick_ms: 0,
@@ -358,6 +364,7 @@ impl ControlLoop {
             now,
             reassert_ms,
         };
+        let config_gen = self.shared.lock().map(|g| g.config_gen).unwrap_or(0);
         for fan_id in FanId::all() {
             let name = fan_id.to_string();
             let Some(config) = fan_configs
@@ -371,6 +378,25 @@ impl ControlLoop {
                 FanId::Cpu => cpu_t.unwrap_or(0.0),
                 FanId::Gpu => gpu_t.unwrap_or(0.0),
             };
+
+            // A changed mode/curve/config means the hysteresis state (and
+            // possibly the last write) reflect the OLD policy — reset both
+            // so the new duty applies on this very tick.
+            {
+                let sig = (
+                    u8::from(config.mode == FanModeKind::Manual)
+                        + 2 * u8::from(config.mode == FanModeKind::Curve),
+                    config.curve.clone(),
+                    config_gen,
+                );
+                if self.fan_sig.get(&name) != Some(&sig) {
+                    if let Some(h) = self.hysteresis.get_mut(&name) {
+                        h.reset();
+                    }
+                    self.last_written.remove(&name);
+                    self.fan_sig.insert(name.clone(), sig);
+                }
+            }
 
             match directive {
                 PhaseDirective::ReleaseToAuto => {
@@ -1095,6 +1121,91 @@ mod tests {
             baseline,
             "no further writes after shutdown restore"
         );
+    }
+
+    #[test]
+    fn curve_edit_applies_immediately_even_downward() {
+        // Regression: hysteresis used to survive curve edits, so lowering
+        // a curve kept the old (higher) duty until temperature fell past
+        // the stale upshift gate — "curves sometimes don't apply".
+        let (mut control, shared, _subs, fake, _cpu_t, _gpu_t) = setup();
+        set_fan_mode(&shared, "cpu", curve_mode("balanced"));
+        let t = Instant::now();
+        control.tick_once(t); // 55°C -> 55%
+
+        // Raise the temp so hysteresis records a high upshift (~60%).
+        control.tick_once(t + Duration::from_secs(1));
+        let before = ops(&fake, FanId::Cpu)
+            .iter()
+            .filter_map(|op| match op {
+                WriteOp::Duty { duty_pct, .. } => Some(*duty_pct),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+
+        // Now the GUI edits the curve down (flat 30%) — this is what
+        // PutCurve does to shared state, including the gen bump.
+        {
+            let mut g = shared.lock().unwrap();
+            g.config.curves.insert(
+                "balanced".into(),
+                CurveDef::from_points(vec![
+                    CurvePoint(40.0, 30),
+                    CurvePoint(95.0, 30),
+                ]),
+            );
+            g.config_gen += 1;
+        }
+        control.tick_once(t + Duration::from_secs(2));
+
+        let duties: Vec<u8> = ops(&fake, FanId::Cpu)
+            .iter()
+            .filter_map(|op| match op {
+                WriteOp::Duty { duty_pct, .. } => Some(*duty_pct),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            duties.last(),
+            Some(&30),
+            "curve edit must apply on the next tick (before={before:?}, duties={duties:?})"
+        );
+    }
+
+    #[test]
+    fn mode_switch_resets_hysteresis() {
+        // Manual at 80%, then switch to a curve that says 30% at the same
+        // temperature: the curve value must apply immediately.
+        let (mut control, shared, _subs, fake, _cpu_t, _gpu_t) = setup();
+        set_fan_mode(
+            &shared,
+            "cpu",
+            FanConfig {
+                mode: FanModeKind::Manual,
+                curve: None,
+                manual_duty_pct: Some(80),
+            },
+        );
+        let t = Instant::now();
+        control.tick_once(t);
+        {
+            let mut g = shared.lock().unwrap();
+            g.config.curves.insert(
+                "low".into(),
+                CurveDef::from_points(vec![CurvePoint(40.0, 30), CurvePoint(95.0, 30)]),
+            );
+        }
+        set_fan_mode(&shared, "cpu", curve_mode("low"));
+        control.tick_once(t + Duration::from_secs(1));
+        let duties: Vec<u8> = ops(&fake, FanId::Cpu)
+            .iter()
+            .filter_map(|op| match op {
+                WriteOp::Duty { duty_pct, .. } => Some(*duty_pct),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(duties.last(), Some(&30), "duties: {duties:?}");
     }
 
     #[test]
