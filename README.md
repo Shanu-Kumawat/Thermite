@@ -23,15 +23,22 @@ overrides, suspend/resume, and crashes by design — see
 
 ## Device support
 
-| Device | Status | Via |
-|---|---|---|
-| Acer Nitro V 15 (ANV15-51) | ✅ **fully tested** — independent fan control, curves, profiles | `acer-wmi` (kernel 7.3+) or the [stopgap DKMS module](driver/acer-wmi-anv15/) on 7.2 |
-| Other Acer Nitro / Predator with the acer-wmi gaming quirk | 🔶 should work, untested | same |
-| ASUS laptops | 🔶 driver wanted — see [the driver guide](docs/DRIVERS.md) | — |
-| HP / other vendors | 🔶 driver wanted | — |
+Thermite rides on the **mainline kernel `acer-wmi` driver**, so compatibility
+follows the kernel's own quirk table — the full model-by-model list with
+support levels lives in [**COMPATIBILITY.md**](COMPATIBILITY.md). In short:
+
+| Level | Models |
+|---|---|
+| ✅ **Full — hardware-tested** | Acer Nitro V 15 (ANV15-51) |
+| 🔶 Full — expected, untested | Nitro AN515-58 / AN16-41, Predator PH16-72, Helios Neo 16 (PHN16-72), PT14-51 |
+| 🔶 Monitor + profiles | Predator PHN16-71 / PH16-71 / PH18-71 (kernel exposes no pwm yet), other 2021+ Nitro/Predator via `predator_v4=1` |
+| 🔶 Driver wanted | ASUS, HP, ThinkPads — see [the driver guide](docs/DRIVERS.md) |
 
 Getting a laptop supported is designed to be a small, testable contribution:
-read [`docs/DRIVERS.md`](docs/DRIVERS.md).
+read [`docs/DRIVERS.md`](docs/DRIVERS.md). "Full — expected" models need
+exactly one thing we can't do ourselves: someone running
+`thermite doctor` + the probe from the driver guide on real hardware and
+reporting back.
 
 ## How it works
 
