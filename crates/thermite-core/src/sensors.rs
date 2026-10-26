@@ -167,13 +167,12 @@ impl Telemetry {
             .or_else(|| self.board_max())
     }
 
-    /// Peak GPU temperature (NVML preferred, then GPU-class sensors, then
-    /// board zones).
+    /// Peak GPU temperature: GPU-class hwmon sensors first (fresh, cheap,
+    /// read every control tick), then NVML, then board zones as a last
+    /// resort.
     pub fn gpu_temp_c(&self) -> Option<f32> {
-        self.gpu
-            .as_ref()
-            .map(|g| g.temp_c)
-            .or_else(|| self.temp_by_class(TempClass::Gpu))
+        self.temp_by_class(TempClass::Gpu)
+            .or_else(|| self.gpu.as_ref().map(|g| g.temp_c))
             .or_else(|| self.board_max())
     }
 
@@ -341,7 +340,8 @@ mod tests {
             tick_ms: 1000,
         };
         assert_eq!(t.cpu_temp_c(), Some(62.0));
-        assert_eq!(t.gpu_temp_c(), Some(47.0)); // NVML preferred
+        // No GPU-class hwmon in this fixture, so NVML is the source.
+        assert_eq!(t.gpu_temp_c(), Some(47.0));
         assert_eq!(
             t.temp_for(&TempSource::Named("Composite".into())),
             Some(67.0)
@@ -363,5 +363,30 @@ mod tests {
         assert_eq!(t.cpu_temp_c(), Some(54.0));
         assert_eq!(t.gpu_temp_c(), Some(54.0));
         assert_eq!(t.temp_for(&TempSource::Cpu), Some(54.0));
+    }
+
+    #[test]
+    fn gpu_temp_prefers_hwmon_over_nvml() {
+        // GPU-class hwmon sensors are fresh every control tick; NVML can
+        // lag or stall, so it is only a fallback when no hwmon GPU exists.
+        let t = Telemetry {
+            temps: vec![TempTelemetry {
+                label: "acer-wmi GPU".into(),
+                class: TempClass::Gpu,
+                temp_c: 53.0,
+            }],
+            gpu: Some(GpuTelemetry {
+                name: "RTX 4050".into(),
+                temp_c: 47.0,
+                power_w: 12.0,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(t.gpu_temp_c(), Some(53.0));
+        let no_hwmon = Telemetry {
+            gpu: t.gpu.clone(),
+            ..Default::default()
+        };
+        assert_eq!(no_hwmon.gpu_temp_c(), Some(47.0));
     }
 }

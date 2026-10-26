@@ -6,8 +6,10 @@
 //! 1 = custom, 2 = auto — note the inverted convention relative to usual
 //! hwmon; the translation from [`HwFanMode`] lives here, in the driver.
 
+use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use thermite_core::{
     Backend, BackendError, CapabilityLevel, CapabilityReport, FanDescriptor, FanId, FanTelemetry,
@@ -33,12 +35,29 @@ pub fn find_acer_hwmon(root: &Path) -> Option<PathBuf> {
         .find(|d| crate::sysfs::hwmon_name(d).is_some_and(|n| is_acer_hwmon_name(&n)))
 }
 
+/// How long a pwm/pwm_enable readback is trusted before re-reading the
+/// (WMI-backed, ~9 ms per access) sysfs attribute. RPM and temperatures are
+/// always read live. Our own writes update the cache immediately, so drift
+/// detection still sees a coherent world; an external override is picked up
+/// within this window.
+pub const READBACK_TTL: Duration = Duration::from_secs(2);
+
+/// Last cached pwm readback for one fan: (cached at, duty %, hw mode).
+#[derive(Debug, Clone, Copy)]
+struct Readback {
+    at: Instant,
+    duty_pct: Option<u8>,
+    hw_mode: Option<HwFanMode>,
+}
+
 /// sysfs-backed driver for the acer-wmi gaming interface.
 pub struct AcerWmiBackend {
     root: PathBuf,
     hwmon: Option<PathBuf>,
     capability: CapabilityReport,
     fans: Vec<FanDescriptor>,
+    readback: BTreeMap<String, Readback>,
+    readback_ttl: Duration,
 }
 
 impl AcerWmiBackend {
@@ -56,6 +75,8 @@ impl AcerWmiBackend {
             root,
             hwmon,
             capability,
+            readback: BTreeMap::new(),
+            readback_ttl: READBACK_TTL,
         }
     }
 
@@ -177,16 +198,40 @@ impl Backend for AcerWmiBackend {
             for fan in &self.fans {
                 let n = Self::fan_index(&fan.id).unwrap_or(0);
                 let rpm = crate::sysfs::parse_num::<u32>(&hwmon.join(format!("fan{n}_input")));
-                let pwm =
-                    crate::sysfs::parse_num::<u32>(&hwmon.join(format!("pwm{n}"))).or_else(|| {
-                        crate::sysfs::parse_num::<u32>(&hwmon.join(format!("pwm{n}_input")))
-                    });
-                let hw_mode = crate::sysfs::parse_num::<u8>(&hwmon.join(format!("pwm{n}_enable")))
-                    .and_then(hw_mode_from_enable);
+                // pwm/pwm_enable are WMI round-trips (~9 ms each); trust the
+                // cached readback for READBACK_TTL, else re-read both.
+                let key = fan.id.to_string();
+                let cached = self
+                    .readback
+                    .get(&key)
+                    .copied()
+                    .filter(|r| r.at.elapsed() < self.readback_ttl);
+                let (duty_pct, hw_mode) = match cached {
+                    Some(r) => (r.duty_pct, r.hw_mode),
+                    None => {
+                        let pwm = crate::sysfs::parse_num::<u32>(&hwmon.join(format!("pwm{n}")))
+                            .or_else(|| {
+                                crate::sysfs::parse_num::<u32>(&hwmon.join(format!("pwm{n}_input")))
+                            });
+                        let hw_mode =
+                            crate::sysfs::parse_num::<u8>(&hwmon.join(format!("pwm{n}_enable")))
+                                .and_then(hw_mode_from_enable);
+                        let duty_pct = pwm.map(pwm_to_pct);
+                        self.readback.insert(
+                            key,
+                            Readback {
+                                at: Instant::now(),
+                                duty_pct,
+                                hw_mode,
+                            },
+                        );
+                        (duty_pct, hw_mode)
+                    }
+                };
                 telemetry.fans.push(FanTelemetry {
                     id: fan.id.clone(),
                     rpm,
-                    duty_pct: pwm.map(pwm_to_pct),
+                    duty_pct,
                     hw_mode,
                 });
             }
@@ -227,7 +272,17 @@ impl Backend for AcerWmiBackend {
             ));
         }
         crate::sysfs::write_str(&file, &enable_value(mode).to_string())
-            .map_err(|e| map_write_err(e, &file))
+            .map_err(|e| map_write_err(e, &file))?;
+        // Write-through: our own writes are reflected in the readback cache
+        // immediately (the next real read is up to READBACK_TTL away).
+        let entry = self.readback.entry(fan.to_string()).or_insert(Readback {
+            at: Instant::now(),
+            duty_pct: None,
+            hw_mode: Some(mode),
+        });
+        entry.at = Instant::now();
+        entry.hw_mode = Some(mode);
+        Ok(())
     }
 
     fn set_fan_duty(&mut self, fan: &FanId, duty_pct: u8) -> Result<(), BackendError> {
@@ -245,7 +300,15 @@ impl Backend for AcerWmiBackend {
             )));
         }
         crate::sysfs::write_str(&file, &pct_to_pwm(duty_pct).to_string())
-            .map_err(|e| map_write_err(e, &file))
+            .map_err(|e| map_write_err(e, &file))?;
+        let entry = self.readback.entry(fan.to_string()).or_insert(Readback {
+            at: Instant::now(),
+            duty_pct: Some(duty_pct),
+            hw_mode: Some(HwFanMode::Custom),
+        });
+        entry.at = Instant::now();
+        entry.duty_pct = Some(duty_pct);
+        Ok(())
     }
 
     fn set_platform_profile(&mut self, profile: &str) -> Result<(), BackendError> {
@@ -489,5 +552,53 @@ mod tests {
             b.set_platform_profile("quiet"),
             Err(BackendError::Unsupported(_))
         ));
+    }
+
+    #[test]
+    fn readback_cached_within_ttl_and_write_through() {
+        let (_d, root) = full_fixture();
+        let mut b = AcerWmiBackend::with_root(root);
+        b.readback_ttl = Duration::from_secs(60);
+
+        let t1 = b.read_telemetry().unwrap();
+        assert_eq!(t1.fan(&FanId::new("cpu")).unwrap().duty_pct, Some(50));
+
+        // Within the TTL the file is not re-read: change it behind the
+        // cache's back and the stale value must be served.
+        let hwmon = b.hwmon.clone().unwrap();
+        std::fs::write(hwmon.join("pwm1"), "200").unwrap();
+        let t2 = b.read_telemetry().unwrap();
+        assert_eq!(t2.fan(&FanId::new("cpu")).unwrap().duty_pct, Some(50));
+
+        // Our own writes ARE reflected immediately (write-through), so the
+        // control loop's drift detection stays coherent.
+        b.set_fan_duty(&FanId::new("cpu"), 80).unwrap();
+        let t3 = b.read_telemetry().unwrap();
+        assert_eq!(t3.fan(&FanId::new("cpu")).unwrap().duty_pct, Some(80));
+        b.set_fan_hw_mode(&FanId::new("cpu"), HwFanMode::Auto)
+            .unwrap();
+        let t4 = b.read_telemetry().unwrap();
+        assert_eq!(
+            t4.fan(&FanId::new("cpu")).unwrap().hw_mode,
+            Some(HwFanMode::Auto)
+        );
+    }
+
+    #[test]
+    fn readback_expires_after_ttl() {
+        let (_d, root) = full_fixture();
+        let mut b = AcerWmiBackend::with_root(root);
+        b.readback_ttl = Duration::ZERO;
+
+        let t1 = b.read_telemetry().unwrap();
+        assert_eq!(t1.fan(&FanId::new("cpu")).unwrap().duty_pct, Some(50));
+        let hwmon = b.hwmon.clone().unwrap();
+        std::fs::write(hwmon.join("pwm1"), "200").unwrap();
+        // TTL 0 -> always re-read -> sees the new file value.
+        let t2 = b.read_telemetry().unwrap();
+        assert_eq!(
+            t2.fan(&FanId::new("cpu")).unwrap().duty_pct,
+            Some(pwm_to_pct(200))
+        );
     }
 }

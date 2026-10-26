@@ -26,15 +26,26 @@ pub use drivers::acer_wmi::AcerWmiBackend;
 pub use drivers::{Driver, DriverMatch};
 pub use fake::{FakeBackend, WriteOp};
 
+use std::time::{Duration, Instant};
+
 use thermite_core::{
     Backend, BackendError, CapabilityReport, FanDescriptor, FanId, HwFanMode, Telemetry,
+    TempTelemetry,
 };
+
+/// How long the display-only generic sensor scan (NVMe, board, wifi,
+/// per-core temps) is trusted. NVMe reads cost ~5-7 ms each and per-core
+/// temps ~2 ms; none of them feed fan control (the driver reports fresh
+/// CPU/GPU-class temps every tick), so they refresh slowly.
+pub const SCAN_TTL: Duration = Duration::from_secs(5);
 
 /// Composite backend: the matched device driver + generic sensors + NVML,
 /// layered so telemetry works even when no driver matches.
 pub struct ThermiteBackend {
     driver: Option<Box<dyn Backend>>,
     nvml: Option<nvml::NvmlSource>,
+    scan_cache: Option<(Instant, Vec<TempTelemetry>)>,
+    scan_ttl: Duration,
 }
 
 impl ThermiteBackend {
@@ -43,6 +54,8 @@ impl ThermiteBackend {
         Self {
             driver: drivers::probe_drivers(std::path::Path::new("/")).map(|m| m.backend),
             nvml: Some(nvml::NvmlSource::new()),
+            scan_cache: None,
+            scan_ttl: SCAN_TTL,
         }
     }
 
@@ -51,6 +64,28 @@ impl ThermiteBackend {
         Self {
             driver: drivers::probe_drivers(root).map(|m| m.backend),
             nvml: None,
+            scan_cache: None,
+            scan_ttl: SCAN_TTL,
+        }
+    }
+
+    /// Display-only sensor scan with a TTL cache; on a scan error the last
+    /// good scan is served (these sensors are not control inputs).
+    fn scan_temps_cached(&mut self) -> Vec<TempTelemetry> {
+        let fresh = self
+            .scan_cache
+            .take()
+            .filter(|(at, _)| at.elapsed() < self.scan_ttl);
+        if let Some((at, temps)) = fresh {
+            self.scan_cache = Some((at, temps.clone()));
+            return temps;
+        }
+        match hwmon::scan_temps() {
+            Ok(temps) => {
+                self.scan_cache = Some((Instant::now(), temps.clone()));
+                temps
+            }
+            Err(_) => self.scan_cache.take().map(|(_, t)| t).unwrap_or_default(),
         }
     }
 }
@@ -84,7 +119,7 @@ impl Backend for ThermiteBackend {
             Some(d) => d.read_telemetry()?,
             None => Telemetry::default(),
         };
-        telemetry.temps.extend(hwmon::scan_temps()?);
+        telemetry.temps.extend(self.scan_temps_cached());
         telemetry.gpu = self.nvml.as_mut().and_then(|n| n.read());
         telemetry.on_ac = power::on_ac();
         Ok(telemetry)
