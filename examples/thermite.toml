@@ -45,13 +45,14 @@ mode = "auto"       # "auto" | "manual" | "curve"
 mode = "auto"
 
 [platform]
-# Profile Thermite keeps applied (one of the firmware's choices — see
-# `thermite profile list`), or "none" to never touch platform profiles.
+# Default is hands-off: Thermite never touches platform profiles, and
+# power-profiles-daemon (or whatever else) owns them. Only set this if you
+# WANT Thermite to hold a profile at boot and after resume — useful when
+# PPD can't express your machine's real modes (e.g. on the Acer ANV15-51,
+# PPD's "performance" is firmware-refused and the real max,
+# "balanced-performance", is unreachable through PPD).
 #
-# Use "none" when power-profiles-daemon (or another tool) manages profiles:
-# it also sets the CPU energy preference, which Thermite deliberately does
-# not. Thermite then focuses purely on fan control.
-active = "balanced"
+# active = "balanced-performance"
 
 # Named curves: strictly increasing temperatures, duty 0-100. A curve's last
 # point is held above its temperature; a single point is a constant duty.
