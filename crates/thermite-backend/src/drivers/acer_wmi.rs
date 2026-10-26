@@ -42,6 +42,11 @@ pub fn find_acer_hwmon(root: &Path) -> Option<PathBuf> {
 /// within this window.
 pub const READBACK_TTL: Duration = Duration::from_secs(2);
 
+/// How long the `platform_profile` readback is trusted. Reading it is a
+/// WMI/ACPI round-trip (~10 ms measured) and it only changes when someone
+/// sets it — so it is cached briefly and updated on our own writes.
+pub const PROFILE_TTL: Duration = Duration::from_secs(5);
+
 /// Last cached pwm readback for one fan: (cached at, duty %, hw mode).
 #[derive(Debug, Clone, Copy)]
 struct Readback {
@@ -58,6 +63,8 @@ pub struct AcerWmiBackend {
     fans: Vec<FanDescriptor>,
     readback: BTreeMap<String, Readback>,
     readback_ttl: Duration,
+    profile_cache: Option<(Instant, Option<String>)>,
+    profile_ttl: Duration,
 }
 
 impl AcerWmiBackend {
@@ -77,6 +84,8 @@ impl AcerWmiBackend {
             capability,
             readback: BTreeMap::new(),
             readback_ttl: READBACK_TTL,
+            profile_cache: None,
+            profile_ttl: PROFILE_TTL,
         }
     }
 
@@ -111,6 +120,18 @@ impl AcerWmiBackend {
         self.hwmon
             .as_ref()
             .map(|h| h.join(format!("pwm{n}_enable")))
+    }
+
+    /// Cached `platform_profile` readback (WMI round-trip per read).
+    fn profile_readback(&mut self) -> Option<String> {
+        if let Some((at, v)) = &self.profile_cache
+            && at.elapsed() < self.profile_ttl
+        {
+            return v.clone();
+        }
+        let v = crate::sysfs::read_opt(&self.root.join("sys/firmware/acpi/platform_profile"));
+        self.profile_cache = Some((Instant::now(), v.clone()));
+        v
     }
 }
 
@@ -253,8 +274,7 @@ impl Backend for AcerWmiBackend {
             }
         }
 
-        telemetry.platform_profile =
-            crate::sysfs::read_opt(&self.root.join("sys/firmware/acpi/platform_profile"));
+        telemetry.platform_profile = self.profile_readback();
         Ok(telemetry)
     }
 
@@ -331,7 +351,9 @@ impl Backend for AcerWmiBackend {
                 self.capability.platform_profiles.join(", ")
             )));
         }
-        crate::sysfs::write_str(&file, profile).map_err(|e| map_write_err(e, &file))
+        crate::sysfs::write_str(&file, profile).map_err(|e| map_write_err(e, &file))?;
+        self.profile_cache = Some((Instant::now(), Some(profile.to_string())));
+        Ok(())
     }
 }
 
@@ -581,6 +603,30 @@ mod tests {
         assert_eq!(
             t4.fan(&FanId::new("cpu")).unwrap().hw_mode,
             Some(HwFanMode::Auto)
+        );
+    }
+
+    #[test]
+    fn profile_readback_cached_and_write_through() {
+        let (_d, root) = full_fixture();
+        let mut b = AcerWmiBackend::with_root(root);
+        b.profile_ttl = Duration::from_secs(60);
+
+        assert_eq!(
+            b.read_telemetry().unwrap().platform_profile.as_deref(),
+            Some("balanced")
+        );
+        // Within the TTL the file is not re-read.
+        std::fs::write(b.root.join("sys/firmware/acpi/platform_profile"), "quiet\n").unwrap();
+        assert_eq!(
+            b.read_telemetry().unwrap().platform_profile.as_deref(),
+            Some("balanced")
+        );
+        // Our own write is reflected immediately.
+        b.set_platform_profile("performance").unwrap();
+        assert_eq!(
+            b.read_telemetry().unwrap().platform_profile.as_deref(),
+            Some("performance")
         );
     }
 

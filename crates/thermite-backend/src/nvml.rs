@@ -2,151 +2,86 @@
 //!
 //! The 615.x proprietary driver exposes no hwmon interface on this machine,
 //! so NVML supplements the GPU hwmon sensor with name + power draw.
-//! NVML calls can occasionally block for ~1 s (driver memory-pressure
-//! windows), so reads are throttled to [`READ_TTL`] and back off
-//! exponentially after errors — a stalled call must never happen every
-//! control tick.
+//! NVML calls can block for ~1 s and burn real CPU during driver
+//! memory-pressure windows (NVRM errors observed periodically on some
+//! driver builds) — running them on the control thread stalled fan control
+//! and aligned with audio-buffer deadlines. All NVML work therefore lives
+//! on a dedicated background thread at a relaxed cadence; `read()` serves
+//! the latest value instantly and never blocks.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use thermite_core::GpuTelemetry;
 
-/// How long one NVML reading is trusted (GPU temp itself comes from hwmon
-/// every tick; NVML adds the display-only name + power draw).
-pub const READ_TTL: Duration = Duration::from_secs(5);
-/// First backoff step after a failed read.
-const BACKOFF_START: Duration = Duration::from_secs(1);
-/// Backoff ceiling.
-const BACKOFF_MAX: Duration = Duration::from_secs(60);
+/// How often the background thread refreshes NVML telemetry.
+const READ_INTERVAL: Duration = Duration::from_secs(30);
+/// Sleep after a failed read; doubles up to [`BACKOFF_MAX`].
+const BACKOFF_START: Duration = Duration::from_secs(5);
+const BACKOFF_MAX: Duration = Duration::from_secs(120);
 
-/// Generic throttle + exponential-backoff wrapper, testable without NVML.
-#[derive(Debug, Default)]
-pub struct Throttle {
-    last_ok: Option<Instant>,
-    next_allowed: Option<Instant>,
-    backoff: Duration,
-}
-
-impl Throttle {
-    /// Whether a read should happen now.
-    fn due(&self, now: Instant) -> bool {
-        match (self.last_ok, self.next_allowed) {
-            (_, Some(t)) => now >= t,
-            (None, None) => true,
-            (Some(t), None) => now.duration_since(t) >= READ_TTL,
-        }
-    }
-
-    fn record_ok(&mut self, now: Instant) {
-        self.last_ok = Some(now);
-        self.next_allowed = None;
-        self.backoff = BACKOFF_START;
-    }
-
-    fn record_err(&mut self, now: Instant) {
-        self.backoff = (self.backoff.max(BACKOFF_START) * 2).min(BACKOFF_MAX);
-        self.next_allowed = Some(now + self.backoff);
-    }
-
-    /// True while in an error backoff window.
-    fn backing_off(&self) -> bool {
-        self.next_allowed.is_some()
-    }
-}
-
-/// Lazily-initialized NVML handle; `None` inside when unavailable.
+/// Background-thread NVML source.
 pub struct NvmlSource {
+    /// Latest reading from the background thread.
     #[cfg(feature = "nvml")]
-    nvml: Option<nvml_wrapper::Nvml>,
-    /// Device name, cached from the first successful access.
-    #[cfg(feature = "nvml")]
-    name: Option<String>,
-    /// Most recent successful reading, served within the cache window.
-    #[cfg(feature = "nvml")]
-    last: Option<GpuTelemetry>,
-    throttle: Throttle,
+    slot: std::sync::Arc<std::sync::Mutex<Option<GpuTelemetry>>>,
     note: Option<String>,
 }
 
+#[cfg(feature = "nvml")]
+type Slot = std::sync::Arc<std::sync::Mutex<Option<GpuTelemetry>>>;
+
+#[cfg(feature = "nvml")]
+static SLOT: std::sync::LazyLock<Slot> =
+    std::sync::LazyLock::new(|| std::sync::Arc::new(std::sync::Mutex::new(None)));
+
 impl NvmlSource {
     /// Try to initialize NVML; failures degrade to an empty source with a
-    /// diagnostic note (surfaced by `thermite doctor` and status).
+    /// diagnostic note (surfaced by `thermite doctor` and status). On
+    /// success this spawns the background reader thread.
     pub fn new() -> Self {
         let mut note = None;
         #[cfg(feature = "nvml")]
-        let nvml = match nvml_wrapper::Nvml::init() {
-            Ok(n) => Some(n),
-            Err(e) => {
-                note = Some(format!("NVML unavailable ({e}); GPU temp via hwmon only"));
-                None
-            }
-        };
+        if let Err(e) = std::thread::Builder::new()
+            .name("nvml-reader".into())
+            .spawn(|| {
+                let mut backoff = BACKOFF_START;
+                loop {
+                    match read_once() {
+                        Ok(Some(t)) => {
+                            *SLOT.lock().unwrap_or_else(|p| p.into_inner()) = Some(t);
+                            backoff = BACKOFF_START;
+                            std::thread::sleep(READ_INTERVAL);
+                        }
+                        // NVML absent/unusable: idle long; the capability
+                        // note already says so.
+                        Ok(None) => std::thread::sleep(Duration::from_secs(3600)),
+                        Err(_) => {
+                            std::thread::sleep(backoff);
+                            backoff = (backoff * 2).min(BACKOFF_MAX);
+                        }
+                    }
+                }
+            })
+        {
+            note = Some(format!("NVML reader thread failed to spawn: {e}"));
+        }
         Self {
             #[cfg(feature = "nvml")]
-            nvml,
-            #[cfg(feature = "nvml")]
-            name: None,
-            #[cfg(feature = "nvml")]
-            last: None,
-            throttle: Throttle::default(),
+            slot: SLOT.clone(),
             note,
         }
     }
 
-    /// Read GPU telemetry, refreshed at most every [`READ_TTL`] (cached
-    /// readings are served in between) with exponential error backoff;
-    /// `None` only when NVML is unavailable or has never succeeded.
+    /// Latest GPU telemetry; never blocks. `None` when NVML is unavailable
+    /// or the background thread has not read yet.
     #[cfg(feature = "nvml")]
-    pub fn read(&mut self) -> Option<GpuTelemetry> {
-        self.read_at(Instant::now())
-    }
-
-    /// `read()` with an injectable clock (tests).
-    #[cfg(feature = "nvml")]
-    fn read_at(&mut self, now: Instant) -> Option<GpuTelemetry> {
-        if self.throttle.due(now) {
-            // Creating the device handle is a cheap in-process lookup; the
-            // blocking risk lives in the temperature/power calls below,
-            // which now run at most once per READ_TTL (or per backoff).
-            let reading = self.nvml.as_ref().and_then(|nvml| {
-                let device = nvml.device_by_index(0).ok()?;
-                if self.name.is_none() {
-                    self.name = Some(
-                        device
-                            .name()
-                            .ok()
-                            .unwrap_or_else(|| "NVIDIA GPU".to_string()),
-                    );
-                }
-                let temp = device
-                    .temperature(nvml_wrapper::enum_wrappers::device::TemperatureSensor::Gpu)
-                    .ok()?;
-                let power = device.power_usage().unwrap_or(0);
-                Some((temp, power))
-            });
-            match reading {
-                Some((temp_c, mw)) => {
-                    self.throttle.record_ok(now);
-                    self.last = Some(GpuTelemetry {
-                        name: self.name.clone().unwrap_or_else(|| "NVIDIA GPU".into()),
-                        temp_c: temp_c as f32,
-                        power_w: mw as f32 / 1000.0,
-                    });
-                }
-                None => self.throttle.record_err(now),
-            }
-        }
-        self.last.clone()
+    pub fn read(&self) -> Option<GpuTelemetry> {
+        self.slot.lock().ok().and_then(|g| g.clone())
     }
 
     #[cfg(not(feature = "nvml"))]
-    pub fn read(&mut self) -> Option<GpuTelemetry> {
+    pub fn read(&self) -> Option<GpuTelemetry> {
         None
-    }
-
-    /// True while the source is in an error backoff window (diagnostics).
-    pub fn backing_off(&self) -> bool {
-        self.throttle.backing_off()
     }
 
     /// Diagnostic notes for capability reports.
@@ -159,39 +94,36 @@ impl NvmlSource {
     }
 }
 
+/// One NVML read cycle on the background thread. `Ok(None)` = NVML not
+/// usable at all; `Err` = transient failure (back off and retry).
+#[cfg(feature = "nvml")]
+fn read_once() -> Result<Option<GpuTelemetry>, ()> {
+    static NVML: std::sync::OnceLock<Result<nvml_wrapper::Nvml, String>> =
+        std::sync::OnceLock::new();
+    let nvml = match NVML
+        .get_or_init(|| nvml_wrapper::Nvml::init().map_err(|e| format!("NVML init failed: {e}")))
+    {
+        Ok(n) => n,
+        Err(_) => return Ok(None),
+    };
+    let device = nvml.device_by_index(0).map_err(|_| ())?;
+    let name = device
+        .name()
+        .ok()
+        .unwrap_or_else(|| "NVIDIA GPU".to_string());
+    let temp_c = device
+        .temperature(nvml_wrapper::enum_wrappers::device::TemperatureSensor::Gpu)
+        .map_err(|_| ())? as f32;
+    let power_w = device.power_usage().unwrap_or(0) as f32 / 1000.0;
+    Ok(Some(GpuTelemetry {
+        name,
+        temp_c,
+        power_w,
+    }))
+}
+
 impl Default for NvmlSource {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn throttle_caches_then_backs_off() {
-        let mut t = Throttle::default();
-        let t0 = Instant::now();
-        assert!(t.due(t0));
-
-        t.record_ok(t0);
-        assert!(!t.due(t0 + Duration::from_secs(4)), "within cache window");
-        assert!(t.due(t0 + READ_TTL), "after READ_TTL");
-
-        t.record_err(t0 + READ_TTL);
-        assert!(!t.due(t0 + READ_TTL + Duration::from_millis(500)));
-        assert!(t.due(t0 + READ_TTL + Duration::from_secs(2)));
-        assert!(t.backing_off());
-
-        // Backoff doubles (1->2->4->...) and caps at 60s.
-        for s in [2, 6, 20, 60, 130, 260] {
-            t.record_err(t0 + READ_TTL + Duration::from_secs(s));
-        }
-        assert_eq!(t.backoff, BACKOFF_MAX);
-
-        // A success clears the backoff state.
-        t.record_ok(t0 + READ_TTL + Duration::from_secs(20));
-        assert!(!t.backing_off());
     }
 }
