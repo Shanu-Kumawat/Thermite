@@ -51,7 +51,7 @@ mode = "auto"
 # Use "none" when power-profiles-daemon (or another tool) manages profiles:
 # it also sets the CPU energy preference, which Thermite deliberately does
 # not. Thermite then focuses purely on fan control.
-active = "none"
+active = "balanced-performance"
 
 # Named curves: strictly increasing temperatures, duty 0-100. A curve's last
 # point is held above its temperature; a single point is a constant duty.
