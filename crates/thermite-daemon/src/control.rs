@@ -31,6 +31,10 @@ use crate::suspend::SuspendEvent;
 pub const RESUME_GRACE: Duration = Duration::from_secs(20);
 /// Minimum time between external-override alerts per fan.
 const OVERRIDE_ALERT_COOLDOWN: Duration = Duration::from_secs(60);
+/// When unwatched and fully idle (no clients, all fans in firmware auto,
+/// failsafe normal), ticks stretch by this factor: the firmware is the
+/// thermostat, so there is nothing time-critical to do.
+const IDLE_TICK_FACTOR: u32 = 3;
 
 /// Values shared by per-fan decisions within one tick.
 #[derive(Debug, Clone, Copy)]
@@ -158,6 +162,11 @@ impl ControlLoop {
                 .lock()
                 .map(|g| Duration::from_millis(g.config.general.poll_interval_ms))
                 .unwrap_or(Duration::from_secs(1));
+            let poll = if self.idle_stretched() {
+                poll * IDLE_TICK_FACTOR
+            } else {
+                poll
+            };
             let deadline = now + poll;
             while Instant::now() < deadline {
                 if stop.load(Ordering::Relaxed) {
@@ -172,6 +181,25 @@ impl ControlLoop {
                 std::thread::sleep(Duration::from_millis(100));
             }
         }
+    }
+
+    /// Whether the tick cadence may stretch: nothing is time-critical when
+    /// no client is connected, every fan is in firmware auto (the firmware
+    /// is the thermostat) and the failsafe is inactive.
+    fn idle_stretched(&self) -> bool {
+        self.subs.count() == 0
+            && self.failsafe.phase() == FailsafePhase::Normal
+            && self.all_fans_auto()
+    }
+
+    fn all_fans_auto(&self) -> bool {
+        self.shared.lock().map_or(false, |g| {
+            g.fan_descriptors.iter().all(|d| {
+                g.fans
+                    .get(d.id.as_str())
+                    .is_none_or(|rt| rt.config.mode == FanModeKind::Auto)
+            })
+        })
     }
 
     /// Reload the configuration file; on validation failure the previous
@@ -670,6 +698,11 @@ impl ControlLoop {
                 _ => None,
             };
         }
+        if self.subs.count() == 0 {
+            // Nobody is listening: skip building/serializing the tick frame
+            // (shared state above is still updated).
+            return;
+        }
         let control = guard.control_snapshot();
         let frame = tick_frame(telemetry, control);
         drop(guard);
@@ -902,6 +935,22 @@ mod tests {
         );
         assert!(ops(&fake, FanId::new("cpu")).is_empty());
         drop((cpu, gpu));
+    }
+
+    #[test]
+    fn idle_stretch_applies_only_when_unwatched_and_auto() {
+        let (control, shared, _subs, _fake, _cpu_t, _gpu_t) = setup();
+        // No subscribers, all fans auto, failsafe normal -> stretch.
+        assert!(control.idle_stretched());
+        // A fan in manual/curve -> no stretch (we are the thermostat).
+        set_fan_mode(&shared, "cpu", curve_mode("balanced"));
+        assert!(!control.idle_stretched());
+        set_fan_mode(&shared, "cpu", FanConfig::default());
+        assert!(control.idle_stretched());
+        // A client connected -> no stretch.
+        let (tx, _rx) = std::sync::mpsc::channel();
+        control.subs.add(tx);
+        assert!(!control.idle_stretched());
     }
 
     #[test]
