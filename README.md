@@ -110,6 +110,19 @@ Configuration lives at `/etc/thermite/thermite.toml` (strictly validated; see
 [`examples/thermite.toml`](examples/thermite.toml)). Runtime changes made
 from the GUI/CLI persist across daemon restarts.
 
+## FAQ
+
+**I want zero background activity — how do I turn Thermite off?**
+
+```sh
+sudo systemctl stop thermite      # and: disable, to keep it off across reboots
+```
+
+On shutdown the daemon returns every fan to the firmware's automatic
+controller, so your laptop simply reverts to stock fan behavior — nothing is
+left stuck at the last commanded duty. Start it again with
+`sudo systemctl start thermite`.
+
 ## Documentation
 
 - [`docs/SAFETY.md`](docs/SAFETY.md) — the failsafe design and the things
