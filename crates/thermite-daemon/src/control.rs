@@ -193,7 +193,7 @@ impl ControlLoop {
     }
 
     fn all_fans_auto(&self) -> bool {
-        self.shared.lock().map_or(false, |g| {
+        self.shared.lock().is_ok_and(|g| {
             g.fan_descriptors.iter().all(|d| {
                 g.fans
                     .get(d.id.as_str())
